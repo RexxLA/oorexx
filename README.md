@@ -1,0 +1,55 @@
+# ooRexx-git
+
+This is a mirror of the SourceForge-based ooRexx svn repo. It is being kept current daily.
+It is not the official ooRexx repository but intended as a way to make building ooRexx easier for those do not have running Subversion installations.
+
+When the mirroring is automated, this line will be deleted.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+When changing the version number of ooRexx you will need to change the following files:
+
+oorexx.ver
+configure.ac
+CHANGES
+ReleaseNotes
+api/oorexxapi.h                         (REXX_INTERPRETER_5_x_x)
+extensions/rxftp/rxftp.cls
+platform/unix/rexx.1
+platform/unix/rexxc.1
+platform/unix/rxqueue.1
+platform/unix/rxsubcom.1
+
+When the library interface changes you need to modify the oorexx.ver
+file. BE CAREFUL! Some of this info has no relationship to the ooRexx package
+version! If you don't know what you are doing, then don't do anything!
+
