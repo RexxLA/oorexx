@@ -104,8 +104,8 @@ jobs:
         run: |
           git merge --no-edit refs/remotes/svn/trunk
 
-      - name: Publish both branches (dry run)
+      - name: Publish both branches
         run: |
-          git push --dry-run --atomic origin \
+          git push --atomic origin \
             refs/remotes/svn/trunk:refs/heads/trunk \
             HEAD:refs/heads/main
