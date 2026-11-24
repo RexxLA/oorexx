@@ -33,7 +33,7 @@ concurrency:
 jobs:
   sync:
     if: github.repository == 'RexxLA/oorexx' || vars.SYNC_SOURCE != ''
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     env:
@@ -50,8 +50,16 @@ jobs:
       - name: Install git-svn
         run: |
           sudo apt-get update
-          sudo apt-get install -y git-svn
-
+          version=$(apt-cache policy git-svn |
+                    awk '/Candidate:/ {print $2}')
+          sudo apt-get install -y --allow-downgrades \
+            "git=$version" \
+            "git-man=$version" \
+            "git-svn=$version" \
+            subversion
+          git --version
+          git svn --version
+	  
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
