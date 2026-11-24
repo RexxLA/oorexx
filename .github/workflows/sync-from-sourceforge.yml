@@ -59,7 +59,7 @@ jobs:
             subversion
           git --version
           git svn --version
-	  
+ 
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
