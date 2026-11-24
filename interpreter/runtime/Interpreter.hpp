@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2021 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -47,6 +47,7 @@
 #ifndef RexxInterpreter_Included
 #define RexxInterpreter_Included
 
+#include <atomic>
 #include "RexxCore.h"
 #include "SysSemaphore.hpp"
 
@@ -72,28 +73,29 @@ public:
     static void processStartup();
     static void processShutdown();
 
-    static inline void getResourceLock() { resourceLock.request(); }
-    static inline void releaseResourceLock() { resourceLock.release(); }
-    static inline void getDispatchLock() { dispatchLock.request(); }
-    static inline void releaseDispatchLock() { dispatchLock.release(); }
+    static inline bool getResourceLock() { return resourceLock().request(); }
+    static inline void releaseResourceLock() { resourceLock().release(); }
+    static inline bool getStartupLock() { return startupLock().request(); }
+    static inline void releaseStartupLock() { startupLock().release(); }
     static inline void createLocks()
     {
-        // these are critical-time locks, which involves special processing on Windows
-        resourceLock.create(true);
-        dispatchLock.create(true);
+        // held for the whole bootstrap, so not a critical-time lock
+        startupLock().create();
+        // this is a critical-time lock, which involves special processing on Windows
+        resourceLock().create(true);
     }
 
     static inline void closeLocks()
     {
-        dispatchLock.close();
-        resourceLock.close();
+        resourceLock().close();
+        startupLock().close();
     }
 
     static int createInstance(RexxInstance *&instance, RexxThreadContext *&threadContext, RexxOption *options);
     static bool terminateInterpreter();
     static void startInterpreter(InterpreterStartupMode mode, const char *imageTarget);
-    static inline bool isTerminated() { return !active; }
-    static inline bool isActive() { return active; }
+    static inline bool isTerminated() { return !active.load(std::memory_order_acquire); }
+    static inline bool isActive() { return active.load(std::memory_order_acquire); }
     static bool lastInstance();
     static InterpreterInstance *createInterpreterInstance(RexxOption *options);
     static inline InterpreterInstance *createInterpreterInstance() { return createInterpreterInstance(NULL); }
@@ -101,8 +103,8 @@ public:
     static bool isInstanceActive(InterpreterInstance *instance);
     static RexxString *getVersionString();
     static void initLocal();
-    static size_t getInterpreterVersion();
-    static size_t getLanguageLevel();
+    static size_t getInterpreterVersion();      // defined in Version.cpp
+    static size_t getLanguageLevel();           // defined in Version.cpp
     static RexxString *getMessageText(wholenumber_t code);
 
     static inline int getWordSize()
@@ -121,27 +123,66 @@ public:
 
 
     static void logicError (const char *desc);
-    static wholenumber_t messageNumber(RexxString *);
+    static wholenumber_t messageNumber(RexxString *, bool isThrow = false);
+    static wholenumber_t syntaxErrorNumber(RexxObject *, bool isThrow);
     static bool haltAllActivities(RexxString *);
     static void decodeConditionData(DirectoryClass *conditionObj, RexxCondition *condData);
     static RexxClass *findClass(RexxString *className);
     static RexxString *getCurrentQueue();
 
     static RexxObject *localServer;         // local environment initialization server
-    static const char *languageLevel;       // the language level of this interpreter
     static RexxString* qualifyFileSystemName(RexxString *name);
+
+    static const char *getLanguageLevelString();
+    static const char *getBuildDate();
 
 protected:
 
     // IMPORTANT NOTE: To avoid deadlocks, never request the kernel lock while holding the resourceLock,
     // otherwise deadlocks are possible. It is permissible to request the resource lock while holding the
     // kernel lock, but this ordering must be strictly observed.
-    static SysMutex  resourceLock;   // use to lock resources accessed outside of kernel global lock
-    static SysMutex  dispatchLock;   // use to lock when manipulating the activity dispatch queue
+    // The startup lock comes before both: it serializes the one-time bootstrap in
+    // startInterpreter(), which needs the kernel lock to create the local server, so it
+    // is taken first (startup lock, then kernel lock, then resource lock) and is never
+    // requested while holding the kernel lock or the resource lock.  See bug #2079.
+    static SysMutex &startupLock();   // serializes interpreter startup
+    // NOTE: this is a function returning a reference to a function-local static, not
+    // a namespace-scope object.  See the definition in Interpreter.cpp for why (bug #2078).
+    static SysMutex &resourceLock();  // use to lock resources accessed outside of kernel global lock
+    // NOTE: the lock for the activity dispatch queue is owned by WaitingActivityQueue,
+    // which is the only thing that can reach the queue it protects.
     static int    initializations;   // indicates whether we're terminated or not
     static QueueClass *interpreterInstances;  // the set of interpreter instances
-    static bool   active;            // indicates whether the interpreter is initialized
+    static std::atomic<bool> active; // indicates whether the interpreter is initialized
     static RexxString *versionNumber;  // our version number information
+
+    static char *languageLevel;       // the language level of this interpreter
+};
+
+
+/**
+ * Block control for the startup lock.  See bug #2079.
+ */
+class StartupSection
+{
+public:
+    inline StartupSection()
+    {
+        // as with ResourceSection, never unlock what was not acquired (bug #2071)
+        acquired = Interpreter::getStartupLock();
+    }
+
+    inline ~StartupSection()
+    {
+        if (acquired)
+        {
+            Interpreter::releaseStartupLock();
+        }
+    }
+
+private:
+
+    bool acquired;
 };
 
 
@@ -153,8 +194,11 @@ class ResourceSection
 public:
     inline ResourceSection()
     {
-        Interpreter::getResourceLock();
-        terminated = false;
+        // if the acquire fails we must NOT unlock in the destructor.  An unbalanced
+        // unlock on a recursive mutex decrements the count and can drop a lock an
+        // outer scope still believes it holds, destroying mutual exclusion for
+        // everyone.  See bug #2071.
+        terminated = !Interpreter::getResourceLock();
     }
 
     inline ~ResourceSection()
@@ -179,8 +223,7 @@ public:
     {
         if (terminated)
         {
-            Interpreter::getResourceLock();
-            terminated = false;
+            terminated = !Interpreter::getResourceLock();
         }
     }
 
@@ -190,49 +233,8 @@ private:
 };
 
 
-/**
- * Block control for access to the dispatch queue.
- */
-class DispatchSection
-{
-public:
-    inline DispatchSection()
-    {
-        Interpreter::getDispatchLock();
-        terminated = false;
-    }
-
-    inline ~DispatchSection()
-    {
-        if (!terminated)
-        {
-            Interpreter::releaseDispatchLock();
-        }
-    }
-
-    inline void release()
-    {
-        if (!terminated)
-        {
-            Interpreter::releaseDispatchLock();
-            terminated = true;
-        }
-    }
-
-
-    inline void reacquire()
-    {
-        if (terminated)
-        {
-            Interpreter::getDispatchLock();
-            terminated = false;
-        }
-    }
-
-private:
-
-    bool terminated;       // we can release these as needed
-};
+// NOTE: DispatchSection is declared in ActivityManager.hpp, next to the dispatch
+// queue it guards.
 
 
 class InstanceBlock

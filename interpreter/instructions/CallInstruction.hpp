@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2018 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -62,6 +62,10 @@ class RexxInstructionCallBase : public RexxInstruction
     inline RexxInstructionCallBase() { ; };
     // subclasses must provide this
     virtual void resolve(StringTable *) = 0;
+    // the builtin function this will call, if any, once resolved
+    virtual BuiltinCode resolvedBuiltin() { return NO_BUILTIN; }
+    // the number of arguments of the call, if it has any
+    virtual size_t getArgumentCount() { return 0; }
 
  protected:
 
@@ -116,6 +120,8 @@ class RexxInstructionCall : public RexxInstructionCallBase
 
     void execute(RexxActivation *, ExpressionStack *) override;
     void resolve(StringTable *) override;
+    BuiltinCode resolvedBuiltin() override { return targetInstruction == OREF_NULL ? builtinIndex : NO_BUILTIN; }
+    size_t getArgumentCount() override { return argumentCount; }
 
 protected:
 
@@ -192,6 +198,7 @@ class RexxInstructionCallOn : public RexxInstructionTrapBase
     void resolve(StringTable *) override;
 
     void trap(RexxActivation *context, DirectoryClass  *conditionObj) override;
+    BuiltinCode resolvedBuiltin() override { return targetInstruction == OREF_NULL ? builtinIndex : NO_BUILTIN; }
 
 protected:
 

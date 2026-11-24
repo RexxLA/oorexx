@@ -68,6 +68,12 @@
 <emphasis role="italic">message</emphasis>.</para>
 </listitem>
 </varlistentry>
+<varlistentry>
+<term>901</term>
+<listitem>
+<para>Program interrupted with <emphasis role="italic">condition</emphasis> condition: <emphasis role="italic">description</emphasis>.</para>
+</listitem>
+</varlistentry>
 </variablelist>
 </section>
 <section id="ERR5">
@@ -256,7 +262,7 @@ else                    end
 <varlistentry>
 <term>003</term>
 <listitem>
-<para>END corresponding to block on line <emphasis role="italic">symbol</emphasis> must not have a symbol following it because there is no LABEL or control variable; found "<emphasis role="italic">line_number</emphasis>".</para>
+<para>END corresponding to block on line <emphasis role="italic">line_number</emphasis> must not have a symbol following it because there is no LABEL or control variable; found "<emphasis role="italic">symbol</emphasis>".</para>
 </listitem>
 </varlistentry>
 <varlistentry>
@@ -280,7 +286,49 @@ else                    end
 <varlistentry>
 <term>007</term>
 <listitem>
-<para>END corresponding to SELECT on line <emphasis role="italic">symbol</emphasis> must not have a symbol following it because there is no LABEL; found "<emphasis role="italic">line_number</emphasis>".</para>
+<para>END corresponding to SELECT on line <emphasis role="italic">line_number</emphasis> must not have a symbol following it because there is no LABEL; found "<emphasis role="italic">symbol</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>008</term>
+<listitem>
+<para>CATCH has no corresponding DO, LOOP, or SELECT.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>009</term>
+<listitem>
+<para>CATCH must not immediately follow THEN.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>011</term>
+<listitem>
+<para>CATCH must not immediately follow ELSE.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>012</term>
+<listitem>
+<para>FINALLY has no corresponding DO, LOOP, or SELECT.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>013</term>
+<listitem>
+<para>FINALLY must not immediately follow THEN.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>014</term>
+<listitem>
+<para>FINALLY must not immediately follow ELSE.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>015</term>
+<listitem>
+<para>A CATCH or FINALLY clause must not follow the FINALLY clause on line <emphasis role="italic">line_number</emphasis>.</para>
 </listitem>
 </varlistentry>
 </variablelist>
@@ -292,8 +340,7 @@ else                    end
 </para>
 <para>The available stack space has been exhausted.
       This could be because of a looping INTERPRET instruction, such as:</para>
-<programlisting>
-line = 'INTERPRET line'
+<programlisting language="rexx">line = 'INTERPRET line'
 INTERPRET line
 </programlisting>
 <para>The INTERPRET instruction loops until all available stack space has been exhausted.
@@ -417,16 +464,14 @@ editbin rexx.exe /stack:100000000
 <emphasis role="bold">Explanation:</emphasis>
 </para>
 <para>Hexadecimal strings must not have leading or trailing whitespace characters and whitespace can only be embedded at byte boundaries.  Only the digits 0-9 and the letters a-f and A-F are allowed.  The following are valid hexadecimal strings: </para>
-<programlisting>
-'13'x
+<programlisting language="rexx">'13'x
 'A3C2 1c34'x
 '1de8'x
 </programlisting>
 <para>Binary strings must not have leading or trailing whitespace characters and whitespace can only be embedded at the boundaries of groups of four binary digits.
     Only the digits 0 and 1 are allowed.
     These are valid binary strings:</para>
-<programlisting>
-'1011'b
+<programlisting language="rexx">'1011'b
 '110 1101'b
 '101101 11010011'b
 </programlisting>
@@ -945,6 +990,24 @@ editbin rexx.exe /stack:100000000
 <para>Symbol expected after COUNTER keyword.</para>
 </listitem>
 </varlistentry>
+<varlistentry>
+<term>935</term>
+<listitem>
+<para>Symbol expected after the NUMERIC subdirective keyword.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>936</term>
+<listitem>
+<para>Symbol expected after CATCH keyword or after a comma in a CATCH clause.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>937</term>
+<listitem>
+<para>Symbol expected after THROW keyword.</para>
+</listitem>
+</varlistentry>
 </variablelist>
 </section>
 <section id="ERR21">
@@ -1162,7 +1225,7 @@ editbin rexx.exe /stack:100000000
 <varlistentry>
 <term>011</term>
 <listitem>
-<para>NUMERIC FORM must be followed by one of the keywords SCIENTIFIC or ENGINEERING; found "<emphasis role="italic">word</emphasis>".</para>
+<para>NUMERIC FORM must be followed by SCIENTIFIC, ENGINEERING, VALUE, or an expression whose value is SCIENTIFIC or ENGINEERING; found "<emphasis role="italic">word</emphasis>".</para>
 </listitem>
 </varlistentry>
 <varlistentry>
@@ -1382,6 +1445,48 @@ editbin rexx.exe /stack:100000000
 <para>WITH must be followed by one of the keywords INPUT, OUTPUT, or ERROR; found "<emphasis role="italic">word</emphasis>".</para>
 </listitem>
 </varlistentry>
+<varlistentry>
+<term>935</term>
+<listitem>
+<para>Subdirective NUMERIC must be followed by one of the keywords INHERIT or NOINHERIT; found "<emphasis role="italic">word</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>936</term>
+<listitem>
+<para>Duplicate keyword on ::<emphasis role="italic">directive</emphasis> directive; found "<emphasis role="italic">keyword</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>937</term>
+<listitem>
+<para>Keyword "<emphasis role="italic">keyword</emphasis>" on ::<emphasis role="italic">directive</emphasis> directive conflicts with "<emphasis role="italic">word</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>938</term>
+<listitem>
+<para>FORM must be followed by one of the keywords SCIENTIFIC or ENGINEERING; found "<emphasis role="italic">word</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>939</term>
+<listitem>
+<para>CATCH must be followed by one or more of the keywords ERROR, FAILURE, HALT, LOSTDIGITS, NOTREADY, NOMETHOD, NOSTRING, NOVALUE, SYNTAX, USER, or ANY, separated by commas; found "<emphasis role="italic">word</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>940</term>
+<listitem>
+<para>THROW must be followed by one of the keywords ERROR, FAILURE, HALT, LOSTDIGITS, NOMETHOD, NOSTRING, NOTREADY, NOVALUE, PROPAGATE, SYNTAX, or USER; found "<emphasis role="italic">word</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>941</term>
+<listitem>
+<para>Unknown keyword on THROW instruction; found "<emphasis role="italic">word</emphasis>".</para>
+</listitem>
+</varlistentry>
 </variablelist>
 </section>
 <section id="ERR26">
@@ -1588,6 +1693,18 @@ editbin rexx.exe /stack:100000000
 <para>Symbol following ITERATE ("<emphasis role="italic">symbol</emphasis>") does not match a repetitive block instruction.</para>
 </listitem>
 </varlistentry>
+<varlistentry>
+<term>006</term>
+<listitem>
+<para>LEAVE in a CATCH clause must not refer to the block instruction on line <emphasis role="italic">line_number</emphasis>, which owns the clause.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>007</term>
+<listitem>
+<para>ITERATE in a CATCH clause must not refer to the block instruction on line <emphasis role="italic">line_number</emphasis>, which owns the clause.</para>
+</listitem>
+</varlistentry>
 </variablelist>
 </section>
 <section id="ERR29">
@@ -1713,6 +1830,12 @@ editbin rexx.exe /stack:100000000
 <term>904</term>
 <listitem>
 <para>Incorrect expression result following SYNTAX keyword of RAISE instruction.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>905</term>
+<listitem>
+<para>Incorrect expression result following SYNTAX keyword of THROW instruction.</para>
 </listitem>
 </varlistentry>
 </variablelist>
@@ -2049,6 +2172,24 @@ editbin rexx.exe /stack:100000000
 <para>Missing expression on ::CONSTANT directive.</para>
 </listitem>
 </varlistentry>
+<varlistentry>
+<term>937</term>
+<listitem>
+<para>Incorrect error number following SYNTAX keyword of CATCH clause; found "<emphasis role="italic">value</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>938</term>
+<listitem>
+<para>Missing expression following DESCRIPTION keyword of a THROW instruction.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>939</term>
+<listitem>
+<para>Missing expression following ADDITIONAL keyword of a THROW instruction.</para>
+</listitem>
+</varlistentry>
 </variablelist>
 </section>
 <section id="ERR36">
@@ -2090,8 +2231,7 @@ editbin rexx.exe /stack:100000000
 Say Enter A, B, or C
 </programlisting>
 <para>as follows:</para>
-<programlisting>
-Say 'Enter A, B, or C'
+<programlisting language="rexx">Say 'Enter A, B, or C'
 </programlisting>
 <para>The associated subcodes are: </para>
 <variablelist>
@@ -2478,6 +2618,20 @@ Say 'Enter A, B, or C'
 <para>Argument <emphasis role="italic">argument</emphasis> must be an array object, a stem object, or a stem name value; found "<emphasis role="italic">value</emphasis>".</para>
 </listitem>
 </varlistentry>
+<varlistentry>
+<term>926</term>
+<listitem>
+<para>
+<emphasis role="italic">function_name</emphasis> argument <emphasis role="italic">argument_number</emphasis> must be an error code nn.nnn, with nn in the range 0-99 and nnn in the range 0-999; found "<emphasis role="italic">value</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>927</term>
+<listitem>
+<para>
+<emphasis role="italic">function_name</emphasis> argument <emphasis role="italic">argument_number</emphasis> must be in the range <emphasis role="italic">minimum</emphasis> to <emphasis role="italic">maximum</emphasis>; found "<emphasis role="italic">value</emphasis>".</para>
+</listitem>
+</varlistentry>
 </variablelist>
 </section>
 <section id="ERR41">
@@ -2536,6 +2690,12 @@ Say 'Enter A, B, or C'
 <term>901</term>
 <listitem>
 <para>Value of RAISE instruction SYNTAX expression must be numeric; found "<emphasis role="italic">value</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>902</term>
+<listitem>
+<para>Value of THROW instruction SYNTAX expression must be numeric; found "<emphasis role="italic">value</emphasis>".</para>
 </listitem>
 </varlistentry>
 </variablelist>
@@ -2717,6 +2877,12 @@ Say 'Enter A, B, or C'
 <term>902</term>
 <listitem>
 <para>Extra token ("<emphasis role="italic">token</emphasis>") found in USE ARG variable reference; "," or end of instruction expected.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>903</term>
+<listitem>
+<para>Extra token ("<emphasis role="italic">token</emphasis>") found in USE ARG name; ",", "=" or end of instruction expected.</para>
 </listitem>
 </varlistentry>
 </variablelist>
@@ -3859,6 +4025,12 @@ Say 'Enter A, B, or C'
 </listitem>
 </varlistentry>
 <varlistentry>
+<term>940</term>
+<listitem>
+<para>Unknown error number specified on THROW SYNTAX; found "<emphasis role="italic">number</emphasis>".</para>
+</listitem>
+</varlistentry>
+<varlistentry>
 <term>941</term>
 <listitem>
 <para>Unknown error number specified on RAISE SYNTAX; found "<emphasis role="italic">number</emphasis>".</para>
@@ -3916,6 +4088,13 @@ Say 'Enter A, B, or C'
 <term>952</term>
 <listitem>
 <para>Circular ::REQUIRES references detected with <emphasis role="italic">name</emphasis>.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>953</term>
+<listitem>
+<para>
+<emphasis role="italic">instruction</emphasis> must not leave the FINALLY clause on line <emphasis role="italic">line_number</emphasis>.</para>
 </listitem>
 </varlistentry>
 <varlistentry>
@@ -4401,6 +4580,19 @@ Say 'Enter A, B, or C'
 <term>950</term>
 <listitem>
 <para>A USE ARG default value is not allowed for variable references.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>951</term>
+<listitem>
+<para>
+<emphasis role="italic">instruction</emphasis> must not leave the FINALLY clause on line <emphasis role="italic">line_number</emphasis>.</para>
+</listitem>
+</varlistentry>
+<varlistentry>
+<term>952</term>
+<listitem>
+<para>FORWARD without CONTINUE on line <emphasis role="italic">line_number</emphasis> must not be in a block with a FINALLY clause.</para>
 </listitem>
 </varlistentry>
 </variablelist>

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -44,6 +44,7 @@
 #ifndef Included_Activity
 #define Included_Activity
 
+#include <atomic>
 #include "ListClass.hpp"
 #include "InternalStack.hpp"
 #include "ActivationStack.hpp"
@@ -57,6 +58,7 @@
 #include "StringTableClass.hpp"
 #include "InterpreterInstance.hpp"
 #include "RexxErrorCodes.h"
+#include <atomic>
 
 
 
@@ -91,6 +93,7 @@ class Activity : public RexxInternalObject
 {
   friend class ProtectedBase;
   friend class ActivationFrame;
+  friend class BuiltinFunctionScope;
  public:
 
     typedef enum
@@ -118,6 +121,13 @@ class Activity : public RexxInternalObject
     wholenumber_t displayCondition(DirectoryClass *conditionObject);
     bool        raiseCondition(RexxString *, RexxObject *, RexxObject *, RexxObject *, RexxObject *);
     bool        raiseCondition(DirectoryClass *);
+    void        checkConditionSyntaxOptions(RexxString *, RexxObject *, RexxObject *);
+    // how raiseConditionObject() raises: as the object says (the
+    // interpreter's own uses), always raised (RaiseConditionObject()), or
+    // always thrown (ThrowObject())
+    typedef enum { CONDITION_AS_IS, CONDITION_RAISE, CONDITION_THROW } ConditionObjectMode;
+    void        raiseConditionObject(DirectoryClass *, ConditionObjectMode mode = CONDITION_AS_IS);
+    void        completeSyntaxCondition(DirectoryClass *);
     bool        checkCondition(RexxString *condition);
     DirectoryClass *createConditionObject(RexxString *, RexxObject *, RexxObject *, RexxObject *, RexxObject *);
     void        raiseException(RexxErrorCodes, RexxString *, ArrayClass *, RexxObject *);
@@ -142,6 +152,11 @@ class Activity : public RexxInternalObject
     void        reportAnException(RexxErrorCodes, const char *, RexxObject *, const char *, RexxObject *);
     void        reraiseException(DirectoryClass *);
     void        raisePropagate(DirectoryClass *);
+    void        throwCondition(DirectoryClass *);
+    void        throwNewCondition(RexxString *, RexxObject *, RexxString *, RexxObject *);
+    void        apiThrow(const char *, RexxObject *, RexxObject *, RexxObject *);
+    static bool isThrown(RexxString *, DirectoryClass *);
+    DirectoryClass *uncaughtThrown(DirectoryClass *);
     void        display(DirectoryClass *);
     void        displayDebug(DirectoryClass *);
     RexxString *buildMessage(wholenumber_t, ArrayClass *);
@@ -174,16 +189,38 @@ class Activity : public RexxInternalObject
     void        guardWait();
     void        guardPost();
     void        guardSet();
+    void        reservePost();
     void        checkDeadLock(Activity *);
     void        postDispatch();
     void        kill(DirectoryClass *);
     void        joinKernelQueue();
     void        relinquish();
     bool        halt(RexxString *);
+    // a HALT requested from any thread, taken at the next clause boundary of
+    // whichever Rexx frame of this activity gets there first
+    // (only by a frame no deeper than the one it was aimed at: a callee pushed
+    // after the request leaves it to its caller, as a HALT posted to a frame did)
+    inline bool haltRequested() { return haltRequest.load(std::memory_order_relaxed) && stackFrameDepth <= haltRequestDepth; }
+    inline bool takeHaltRequest(RexxString *&d)
+    {
+        if (!haltRequested() || !haltRequest.exchange(false, std::memory_order_acquire)) return false;
+        d = haltRequestDescription; haltRequestDescription = OREF_NULL; return true;
+    }
+    inline void clearHaltRequest()
+    {
+        if (haltRequest.load(std::memory_order_acquire) && haltRequestDepth > stackFrameDepth)
+        {
+            haltRequest.store(false, std::memory_order_release);
+            haltRequestDescription = OREF_NULL;
+        }
+    }
     bool        setTrace(bool);
     inline void yieldControl() { releaseAccess(); requestAccess(); }
     void        yield();
-    void        releaseAccess();
+    // read on the interpreter's hot path, so keep this a relaxed load
+    inline bool isYieldRequested() { return yieldRequested.load(std::memory_order_relaxed); }
+    inline void clearYieldRequest() { yieldRequested.store(false, std::memory_order_relaxed); }
+    void        releaseAccess(bool dispatch = true);
     void        requestApiAccess();
     void        requestAccess();
     void        setupCurrentActivity();
@@ -218,6 +255,10 @@ class Activity : public RexxInternalObject
     void sayOutput(RexxActivation *, RexxString *);
     void queue(RexxActivation *, RexxString *, QueueOrder);
     RexxString *traceInput(RexxActivation *);
+    inline bool isReadingDebugInput() { return readingDebugInput; }
+    inline bool isRunningTraceCode() { return runningTraceCode > 0; }
+    inline void enterTraceCode() { runningTraceCode++; }
+    inline void leaveTraceCode() { runningTraceCode--; }
     RexxString *pullInput(RexxActivation *);
     RexxObject *lineOut(RexxString *);
     RexxString *lineIn(RexxActivation *);
@@ -232,12 +273,19 @@ class Activity : public RexxInternalObject
     void nestAttach();
     void returnAttach();
     inline bool isNestedAttach() { return attachCount > 1 || (attachCount == 1 && !newThreadAttached); }
-    inline void activate() { nestedCount++; }
-    inline void deactivate() { nestedCount--; }
-    inline bool isActive() { return nestedCount > 0; }
-    inline bool isInactive() { return nestedCount == 0; }
-    inline size_t getActivationLevel() { return nestedCount; }
-    inline void restoreActivationLevel(size_t l) { nestedCount = l; }
+    // nestedCount is written by the thread running this activity and read by
+    // other threads: InterpreterInstance::removeInactiveActivities() asks
+    // isActive() about activities it does not own. Relaxed ordering is enough,
+    // since this only reports whether the activity is busy; the kernel lock
+    // provides the actual ordering. Note that a caller acting on the answer is
+    // racing with the owner by nature -- making the field atomic removes the
+    // undefined behaviour, not that inherent race.
+    inline void activate() { nestedCount.fetch_add(1, std::memory_order_relaxed); }
+    inline void deactivate() { nestedCount.fetch_sub(1, std::memory_order_relaxed); }
+    inline bool isActive() { return nestedCount.load(std::memory_order_relaxed) > 0; }
+    inline bool isInactive() { return nestedCount.load(std::memory_order_relaxed) == 0; }
+    inline size_t getActivationLevel() { return nestedCount.load(std::memory_order_relaxed); }
+    inline void restoreActivationLevel(size_t l) { nestedCount.store(l, std::memory_order_relaxed); }
     inline bool isSuspended() { return suspended; }
     inline void clearWaitingForDispatch() { waitingForDispatch = false; }
     inline void setWaitingForDispatch() { waitingForDispatch = true; }
@@ -261,7 +309,7 @@ class Activity : public RexxInternalObject
     void inheritSettings(Activity *parent);
     void setupExits();
     void enterCurrentThread();
-    void exitCurrentThread();
+    void exitCurrentThread(bool dispatch = true);
     void run(ActivityDispatcher &target);
     void run(CallbackDispatcher &target);
     void run(TrappingDispatcher &target);
@@ -286,10 +334,25 @@ class Activity : public RexxInternalObject
     inline void        waitForRunPermission() { waitingOnSemaphore = true; runSem.wait(); waitingOnSemaphore = false; }
     inline bool        hasRunPermission() { return dispatchPosted; }
     inline void        waitForGuardPermission() { waitingOnSemaphore = true; guardSem.wait(); waitingOnSemaphore = false; }
+    inline void        waitForReservePermission() { waitingOnSemaphore = true; reserveSem.wait(); waitingOnSemaphore = false; }
            void        waitForKernel();
 
     inline RexxActivation *getCurrentRexxFrame() {return currentRexxFrame;}
+    inline void setCallbackParent(RexxActivation *a) {callbackParent = a;}
     inline ActivationBase *getTopStackFrame() { return topStackFrame; }
+
+    // A built-in function that delegates the checking of its arguments to the
+    // method that implements it (LEFT calls RexxString::left) marks itself
+    // with a BuiltinFunctionScope.  The argument helpers then report a bad
+    // argument as the function's error (40.xxx), with the function's name and
+    // argument position, instead of as a method error (93.xxx).  Only while
+    // the function's own frame is the top one: anything reached through a
+    // message send (user code, a STRING method, a stream) runs in a frame of
+    // its own and keeps its method errors.
+    inline bool inBuiltinFunction() { return builtinName != NULL && builtinFrame == activationFrames; }
+    void builtinArgumentError(RexxErrorCodes error, size_t methodPosition, RexxObject *value);
+    void builtinOptionError(size_t methodPosition, const char *options, RexxObject *value);
+    void builtinTargetError(RexxErrorCodes error, RexxObject *value);
     inline size_t getActivationDepth() { return stackFrameDepth; }
     inline const NumericSettings *getNumericSettings () {return numericSettings;}
     inline void        addRunningRequires(RexxString *program) { requiresTable->put(program, program);}
@@ -297,6 +360,7 @@ class Activity : public RexxInternalObject
            void        checkRequires(RexxString *n);
     inline void        clearRunWait()  { runSem.reset(); dispatchPosted = false; }
     inline void        clearGuardWait()  { guardSem.reset(); }
+    inline void        clearReserveWait() { reserveSem.reset(); }
            uint64_t    getRandomSeed();
            RexxString *getLastMessageName();
 
@@ -367,6 +431,9 @@ class Activity : public RexxInternalObject
     // is the current size of the stack (which is expanded, if necessary).  The
     // activationStackDepth is the current count of frames in the stack.
     InternalStack *activations;
+    std::atomic<bool> haltRequest{false};       // see takeHaltRequest()
+    RexxString *haltRequestDescription = OREF_NULL;
+    size_t haltRequestDepth = 0;                // the depth of the frame it was aimed at
     size_t   activationStackSize;
     size_t   stackFrameDepth;
 
@@ -378,24 +445,40 @@ class Activity : public RexxInternalObject
     // Rexx context, then the topStackFrame will be the NativeActivation that
     // made the callout and the currentRexxFrame will be the predecessor frame.
     RexxActivation     *currentRexxFrame;
+    RexxActivation     *callbackParent;     // the parent frame for the next callback, if not currentRexxFrame
     ActivationBase     *topStackFrame;  // top-most activation frame (can be either native or Rexx).
     RexxString         *currentExit;    // current executing system exit
     RexxInternalObject *waitingObject;  // object activity is waiting on
     SysSemaphore        runSem;         // activity run control semaphore
     SysSemaphore        guardSem;       // guard expression semaphore
+    SysSemaphore        reserveSem;     // scope lock reservation semaphore
     SysActivity currentThread;          // descriptor for this thread
     const NumericSettings *numericSettings; // current activation setting values
 
     bool     stackcheck;                // stack space is to be checked (disabled during some error handling)
     bool     exit;                      // activity loop is to exit
     bool     requestingString;          // in error handling currently
+    bool     sendingTraceOutput;        // a trace line is being sent to the .traceoutput target
+    bool     displayingCondition;       // an error is being displayed
+    bool     traceTargetFailed;         // the .traceoutput target failed while displaying it
+    bool     readingDebugInput;         // a line of debug input is being read from .debuginput
+    size_t   runningTraceCode;          // > 0 while a trace line runs Rexx code (TraceObject, its collector...)
     bool     suspended;                 // the suspension flag
     bool     interpreterRoot;           // This is the root activity for an interpreter instance
     bool     waitingForApiAccess;       // This activity is waiting for access for an API callback
-    bool     waitingForDispatch;        // This activity is in the dispatch queue waiting to be dispatched.
+    bool     waitingForDispatch;        // This activity is waiting for the kernel lock (in addWaitingActivity() or
+                                        // addWaitingApiActivity()), whether or not it is in the dispatch queue.
     bool     waitingOnSemaphore;        // activity is blocked while waiting for any semaphore
-    bool     dispatchPosted;            // we have been given permission to run
-    size_t   nestedCount;               // extent of the nesting
+    // atomic: read by hasRunPermission() from other threads while the owner
+    // clears/sets it -- TSan flags this, and it is the exact crash site.  bug #2074
+    std::atomic<bool> dispatchPosted;   // we have been given permission to run
+    // Set by a thread that wants this activity to give up control at its next
+    // instruction boundary.  This must be atomic: it is written by the thread
+    // requesting access and read by the thread running Rexx code, and those two
+    // hold no lock in common.  Relaxed ordering is enough, since this only
+    // requests a yield -- the kernel lock provides the actual ordering.
+    std::atomic<bool> yieldRequested;
+    std::atomic<size_t> nestedCount;    // extent of the nesting, read by other threads
     size_t   attachCount;               // extent of nested attaches
     bool     newThreadAttached;         // Indicates this thread was a "side door" attach.
     char    *stackLimit;                // pointer to base to the C stack location that will trigger a control stack error
@@ -405,6 +488,9 @@ class Activity : public RexxInternalObject
     ActivationFrame *activationFrames;  // list of stack-based object protectors
     Activity *nestedActivity;           // used to push down activities in threads with more than one instance
     IdentityTable *heldMutexes;         // a list of Mutex objects owned by this activity.
+    const char *builtinName = NULL;     // the built-in function running (see BuiltinFunctionScope)
+    ActivationFrame *builtinFrame = NULL; // the frame it was called from
+    size_t builtinTarget = 1;           // its argument that is the target of the method it calls
 
     // structures containing the various interface vectors
     static RexxThreadInterface threadContextFunctions;

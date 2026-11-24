@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2020 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -55,6 +55,29 @@ class RoutineClass;
 class Activity;
 class DirectoryClass;
 class LibraryPackage;
+
+
+
+typedef enum
+{
+    DigitsFlag,     // NUMERIC
+    FormFlag,       // NUMERIC ENGINEERING/SCIENTIFIC
+    FuzzFlag,       // NUMERIC
+    NumericFlag,    // INHERIT/NOINHERIT
+
+    ErrorFlag,      // CONDITION/SYNTAX, also set by ALL
+    FailureFlag,    // CONDITION/SYNTAX, also set by ALL
+    LostdigitsFlag, // CONDITION/SYNTAX, also set by ALL
+    NostringFlag,   // CONDITION/SYNTAX, also set by ALL
+    NotreadyFlag,   // CONDITION/SYNTAX, also set by ALL
+    NovalueFlag,    // CONDITION/SYNTAX, also set by ALL
+
+    PrologFlag,     // PROLOG
+    NoprologFlag,   // NOPROLOG
+
+    TraceFlag,      // TRACE
+}  OptionsSetFlags; // records which options got explicitly set with ::OPTIONS directives
+
 
 
 /**
@@ -164,24 +187,78 @@ public:
     inline const TraceSetting &getTraceSetting() { return packageSettings.getTraceSetting(); }
     inline const PackageSetting &getSettings() { return packageSettings; }
     inline bool  isRexxPackage() { return this == TheRexxPackage; }
-    inline void  setLanguageLevel(LanguageLevel l) { requiredLanguageLevel = l; }
+    inline void  setLanguageLevel(LanguageLevel l) { if (l>requiredLanguageLevel) requiredLanguageLevel = l; }
     inline LanguageLevel getLanguageLevel() { return requiredLanguageLevel; }
+
+    inline bool isErrorSyntaxEnabled() { return packageSettings.isErrorSyntaxEnabled(); }
     inline void enableErrorSyntax() { packageSettings.enableErrorSyntax(); }
     inline void disableErrorSyntax() { packageSettings.disableErrorSyntax(); }
+    inline bool isFailureSyntaxEnabled() { return packageSettings.isFailureSyntaxEnabled(); }
     inline void enableFailureSyntax() { packageSettings.enableFailureSyntax(); }
     inline void disableFailureSyntax() { packageSettings.disableFailureSyntax(); }
+    inline bool isLostdigitsSyntaxEnabled() { return packageSettings.isLostdigitsSyntaxEnabled(); }
     inline void enableLostdigitsSyntax() { packageSettings.enableLostdigitsSyntax(); }
     inline void disableLostdigitsSyntax() { packageSettings.disableLostdigitsSyntax(); }
+    inline bool isNotreadySyntaxEnabled() { return packageSettings.isNotreadySyntaxEnabled(); }
     inline void enableNotreadySyntax() { packageSettings.enableNotreadySyntax(); }
     inline void disableNotreadySyntax() { packageSettings.disableNotreadySyntax(); }
+    inline bool isNostringSyntaxEnabled() { return packageSettings.isNostringSyntaxEnabled(); }
     inline void enableNostringSyntax() { packageSettings.enableNostringSyntax(); }
     inline void disableNostringSyntax() { packageSettings.disableNostringSyntax(); }
+    inline bool isNovalueSyntaxEnabled() { return packageSettings.isNovalueSyntaxEnabled(); }
     inline void enableNovalueSyntax() { packageSettings.enableNovalueSyntax(); }
     inline void disableNovalueSyntax() { packageSettings.disableNovalueSyntax(); }
     inline void enableProlog() { packageSettings.enableProlog(); }
     inline void disableProlog() { packageSettings.disableProlog(); }
-    inline bool isPrologEnabled() { return packageSettings.isPrologEnabled() && initCode != OREF_NULL; }
+    inline bool isPrologEnabled() { return packageSettings.isPrologEnabled(); }
     inline RoutineClass *getMain() { return (RoutineClass *)mainExecutable; }
+
+    inline bool isNumericInheritEnabled() { return packageSettings.isNumericInheritEnabled(); }
+    inline void enableNumericInherit() { packageSettings.enableNumericInherit(); }
+    inline void disableNumericInherit() { packageSettings.disableNumericInherit(); }
+
+    // SetFlag<OptionsSetFlags> related ---
+    inline void setExplicitDigitsOption() { optionsExplicitlySet[DigitsFlag] = true; }
+    inline bool isExplicitDigitsOption() { return optionsExplicitlySet[DigitsFlag]; }
+
+    inline void setExplicitFormOption() { optionsExplicitlySet[FormFlag] = true; }
+    inline bool isExplicitFormOption() { return optionsExplicitlySet[FormFlag]; }
+
+    inline void setExplicitFuzzOption() { optionsExplicitlySet[FuzzFlag] = true; }
+    inline bool isExplicitFuzzOption() { return optionsExplicitlySet[FuzzFlag]; }
+
+    inline void setExplicitNumericOption() { optionsExplicitlySet[NumericFlag] = true; }
+    inline bool isExplicitNumericOption() { return optionsExplicitlySet[NumericFlag]; }
+
+    inline void setExplicitErrorOption() { optionsExplicitlySet[ErrorFlag] = true; }
+    inline bool isExplicitErrorOption() { return optionsExplicitlySet[ErrorFlag]; }
+
+    inline void setExplicitFailureOption() { optionsExplicitlySet[FailureFlag] = true; }
+    inline bool isExplicitFailureOption() { return optionsExplicitlySet[FailureFlag]; }
+
+    inline void setExplicitLostdigitsOption() { optionsExplicitlySet[LostdigitsFlag] = true; }
+    inline bool isExplicitLostdigitsOption() { return optionsExplicitlySet[LostdigitsFlag]; }
+
+    inline void setExplicitNotreadyOption() { optionsExplicitlySet[NotreadyFlag] = true; }
+    inline bool isExplicitNotreadyOption() { return optionsExplicitlySet[NotreadyFlag]; }
+
+    inline void setExplicitNostringOption() { optionsExplicitlySet[NostringFlag] = true; }
+    inline bool isExplicitNostringOption() { return optionsExplicitlySet[NostringFlag]; }
+
+    inline void setExplicitNovalueOption() { optionsExplicitlySet[NovalueFlag] = true; }
+    inline bool isExplicitNovalueOption() { return optionsExplicitlySet[NovalueFlag]; }
+
+    inline void setExplicitPrologOption() { optionsExplicitlySet[PrologFlag] = true; }
+    inline void clearExplicitPrologOption() { optionsExplicitlySet[PrologFlag] = false; }
+    inline bool isExplicitPrologOption() { return optionsExplicitlySet[PrologFlag]; }
+
+    inline void setExplicitNoprologOption() { optionsExplicitlySet[NoprologFlag] = true; }
+    inline void clearExplicitNoprologOption() { optionsExplicitlySet[NoprologFlag] = false; }
+    inline bool isExplicitNoprologOption() { return optionsExplicitlySet[NoprologFlag]; }
+
+    inline void setExplicitTraceOption() { optionsExplicitlySet[TraceFlag] = true; }
+    inline bool isExplicitTraceOption() { return optionsExplicitlySet[TraceFlag]; }
+
 
            RexxString    *getTrace();
            ProgramSource *detachSource();
@@ -226,6 +303,39 @@ public:
            void addNamespace(RexxString *name, PackageClass *package);
            DirectoryClass *getPackageLocal();
 
+
+           RexxObject    *options(RexxString *optionName, RexxString *newValue);      // package related
+           RexxObject    *clzOptions(RexxString *optionName, RexxString *newValue);   // class level (override related)
+
+    inline PackageSetting getPackageSettings(){ return packageSettings; }
+    inline void           setPackageSettings(const PackageSetting &s) { packageSettings = s; }
+
+    inline void           saveInitialPackageSettings()  // save initial packageSettings if not already done so
+                          {
+                              if (!savedInitialPackageSettings)
+                              {
+                                  initialPackageSettings = packageSettings;
+                                  savedInitialPackageSettings = true;
+                              }
+                          };
+
+    inline PackageSetting getInitialPackageSettings()   // no override might have happened so far
+                          {
+                              saveInitialPackageSettings();
+                              return initialPackageSettings;
+                          }
+
+
+    // Override default options that are not explicitly set in a package using psOverridePackageSettings
+    static bool overridePackageSettings(PackageClass *package);
+
+    // used for both, psOverridePackageSettings or package's packageSettings
+    static PackageSetting setPackageSettings(RexxString *newValue, bool setOverride = true, PackageClass *package = OREF_NULL);
+
+    // Return the package's explicitly set options as a blank delimited string of ::OPTIONS subkeywords
+    RexxString *optionsExplicitlySetToString();
+
+
 protected:
 
     LanguageLevel requiredLanguageLevel; // the language version required to run this program
@@ -266,6 +376,16 @@ protected:
 
     PackageSetting packageSettings;       // the settings we use at run time.
     DirectoryClass *packageLocal;         // the .local values attached to this package
+
+    PackageSetting initialPackageSettings;// the settings determined after compile() in LanguageParser::generateProgram()
+    bool savedInitialPackageSettings;     // true, if initial packageSettings got saved in initialPackageSettings
+
+    // cf. documentation for Package's class method "defaultOptions"
+    static wholenumber_t overrideCount;   // overrideCount: 0=no override, each non-0 override reduces it by 1
+    static PackageSetting psOverridePackageSettings;
+    static bool  needOverrideSettingsInialization;  // psOverridePackageSettings needs a one time initialization
+
+    FlagSet<OptionsSetFlags> optionsExplicitlySet;  // options explicitly set by package author
 
     // settings inherited from ::options statements
     intptr_t reserved[11];                // some reserved values for compatible expansion

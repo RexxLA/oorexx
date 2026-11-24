@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2014 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -46,6 +46,7 @@
 #include "ContextApi.hpp"
 #include "InterpreterInstance.hpp"
 #include "Interpreter.hpp"
+#include "Activity.hpp"
 
 BEGIN_EXTERN_C()
 
@@ -86,18 +87,93 @@ size_t RexxEntry LanguageLevel(RexxInstance *)
     return Interpreter::getLanguageLevel();
 }
 
-void RexxEntry AddCommandEnvironment(RexxInstance *c, const char *name, REXXPFN handler, int type)
+/**
+ * The common part of AddCommandEnvironment and StackCommandEnvironment.
+ *
+ * @param c       The instance.
+ * @param name    The environment name.
+ * @param handler The handler's entry point.
+ * @param type    DIRECT_COMMAND_ENVIRONMENT or REDIRECTING_COMMAND_ENVIRONMENT.
+ * @param stack   true to cover the handler in use under that name
+ *                (StackCommandEnvironment), false to add it as
+ *                AddCommandEnvironment always has.
+ *
+ * @return true if the handler was added; false for a type that is not one
+ *         of the two (nothing is done).
+ */
+static bool addCommandEnvironment(RexxInstance *c, const char *name, REXXPFN handler, int type, bool stack)
 {
     InstanceApiContext context(c);
 
+    HandlerType::Enum handlerType;
     if (type == DIRECT_COMMAND_ENVIRONMENT)
     {
-        context.instance->addCommandHandler(name, handler, HandlerType::DIRECT);
+        handlerType = HandlerType::DIRECT;
     }
     else if (type == REDIRECTING_COMMAND_ENVIRONMENT)
     {
-        context.instance->addCommandHandler(name, handler, HandlerType::REDIRECTING);
+        handlerType = HandlerType::REDIRECTING;
     }
+    else
+    {
+        return false;
+    }
+
+    bool added = false;
+    // The handler table is a Rexx object, and adding to it creates objects, so
+    // this needs the interpreter lock: it is usually called from native code,
+    // which runs without the lock while other threads may be running Rexx code.
+    // A thread of this instance reenters its activity (as the thread context
+    // functions do); any other thread is attached for the duration of the call.
+    Activity *activity = context.instance->findActivity();
+    bool attached = activity == OREF_NULL;
+    if (attached)
+    {
+        bool created = false;
+        activity = context.instance->attachThread(created);   // holds the lock
+    }
+    else
+    {
+        activity->enterCurrentThread();
+    }
+    try
+    {
+        if (stack)
+        {
+            context.instance->stackCommandHandler(name, handler, handlerType);
+        }
+        else
+        {
+            context.instance->addCommandHandler(name, handler, handlerType);
+        }
+        added = true;
+    }
+    catch (NativeActivation *)
+    {
+    }
+    if (attached)
+    {
+        context.instance->detachThread(activity);
+    }
+    else
+    {
+        activity->exitCurrentThread();
+    }
+    return added;
+}
+
+void RexxEntry AddCommandEnvironment(RexxInstance *c, const char *name, REXXPFN handler, int type)
+{
+    addCommandEnvironment(c, name, handler, type, false);
+}
+
+logical_t RexxEntry StackCommandEnvironment(RexxInstance *c, const char *name, REXXPFN handler, int type)
+{
+    if (name == NULL || handler == NULL)
+    {
+        return false;
+    }
+    return addCommandEnvironment(c, name, handler, type, true);
 }
 
 END_EXTERN_C()
@@ -113,4 +189,5 @@ RexxInstanceInterface InterpreterInstance::interfaceVector =
     Halt,
     SetTrace,
     AddCommandEnvironment,
+    StackCommandEnvironment,
 };

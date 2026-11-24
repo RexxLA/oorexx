@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2020 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -320,19 +320,43 @@ RoutineClass *PackageManager::resolveRoutine(RexxString *function, RexxString *p
         return func;
     }
 
+    // if the library is an ooRexx package, an entry that it defines as a
+    // new-style routine cannot be called as a registered (classic) function:
+    // the symbol of that name has another signature, and calling it crashed
+    // (bug #2188).
+    // RxFuncAdd() never gets here for a package library.
+    LibraryPackage *package = loadLibrary(packageName);
+    if (package != OREF_NULL)
+    {
+        RexxRoutineEntry *entry = package->locateRoutineEntry(procedure);
+        if (entry != NULL && entry->style != ROUTINE_CLASSIC_STYLE)
+        {
+            return OREF_NULL;
+        }
+    }
+
     const char *functionName = function->getStringData();
     const char *libraryName = packageName->getStringData();
     const char *procedureName = procedure->getStringData();
 
+    RexxReturnCode rc;
     {
         UnsafeBlock releaser;   // don't hold the block while making the API call
-        // go register this (unconditionally....at this point, we don't care if this fails)
-        RexxRegisterFunctionDll(functionName, libraryName, procedureName);
+        // go register this (it may already be registered, which is fine)
+        rc = RexxRegisterFunctionDll(functionName, libraryName, procedureName);
     }
 
-
     // resolve a registered entry, if we can and add it to the cache
-    return createRegisteredRoutine(function);
+    func = createRegisteredRoutine(function);
+    // if it cannot be resolved, do not leave behind a registration we just
+    // made: it is global, and RxFuncQuery() would report the function as
+    // available to every later process (bug #2134)
+    if (func == OREF_NULL && rc == RXFUNC_OK)
+    {
+        UnsafeBlock releaser;
+        RexxDeregisterFunction(functionName);
+    }
+    return func;
 }
 
 
@@ -414,6 +438,26 @@ RoutineClass *PackageManager::loadRoutine(RexxString *packageName, RexxString *f
 
 
 /**
+ * Test for one of the retired routines of the REXX package: BEEP, DIRECTORY
+ * and FILESPEC, built-in functions since 5.3.0 (see
+ * BuiltinFunctionSupport.hpp).  The routines stay in packageRoutines, where
+ * callNativeRoutine() finds them for the programs compiled by older
+ * releases, which call them as external routines.  But, as for any other
+ * built-in function, RxFuncQuery() must not report an external function of
+ * that name, and RxFuncAdd() must be able to register one (which a call in
+ * source code does not reach, as for any other built-in function).
+ *
+ * @param name   The uppercase function name.
+ *
+ * @return true for BEEP, DIRECTORY and FILESPEC.
+ */
+bool PackageManager::isRetiredRoutine(RexxString *name)
+{
+    return name->strCompare("BEEP") || name->strCompare("DIRECTORY") || name->strCompare("FILESPEC");
+}
+
+
+/**
  * Locate an already loaded function.
  *
  * @param function  The function name.
@@ -423,11 +467,12 @@ RoutineClass *PackageManager::loadRoutine(RexxString *packageName, RexxString *f
  */
 RoutineClass *PackageManager::getLoadedRoutine(RexxString *function)
 {
-    // see if we have this one already as a package function
+    // see if we have this one already as a package function (the retired
+    // routines of the REXX package are not reported: see isRetiredRoutine())
     RoutineClass *func = (RoutineClass *)packageRoutines->get(function);
 
     // if we have this, then we can return it directly.
-    if (func != OREF_NULL)
+    if (func != OREF_NULL && !isRetiredRoutine(function))
     {
         return func;
     }
@@ -677,7 +722,8 @@ bool PackageManager::callNativeRoutine(Activity *activity, RexxString *name,
     // all of our tables use uppercase names...make this a case-insensitive lookup
     name = name->upper();
 
-    // package functions come first
+    // package functions come first (the retired routines of the REXX package
+    // included: only programs compiled by older releases get here for them)
     RoutineClass *function = (RoutineClass *)packageRoutines->get(name);
     if (function != OREF_NULL)
     {
@@ -720,13 +766,16 @@ PackageClass *PackageManager::loadRequires(Activity *activity, RexxString *short
     SecurityManager *manager = activity->getEffectiveSecurityManager();
     RexxObject *securityManager = OREF_NULL;
 
-    shortName = manager->checkRequiresAccess(shortName, securityManager);
+    // the security manager can replace the name with a new object, which
+    // nothing else holds: protect it while we use it
+    Protected<RexxString> checkedShortName = manager->checkRequiresAccess(shortName, securityManager);
     // no return means forbidden access to this name.  Just return
     // nothing
-    if (shortName == OREF_NULL)
+    if (checkedShortName.isNull())
     {
         return OREF_NULL;
     }
+    shortName = checkedShortName;
 
 
     // first check this using the specified name.  Since we need to perform checks in the
@@ -744,7 +793,11 @@ PackageClass *PackageManager::loadRequires(Activity *activity, RexxString *short
     // we need to look in the macrospace before we try checking for a file-based
     // requires.  The macrospace version uses the original name for all checks.  Once we
     // get to the file-based version, we switch to the full resolved name.
-    bool checkMacroSpace = RexxQueryMacro(shortName->getStringData(), &macroPosition) == 0;
+    bool checkMacroSpace;
+    {
+        UnsafeBlock releaser;   // don't hold the kernel lock while asking rxapi
+        checkMacroSpace = RexxQueryMacro(shortName->getStringData(), &macroPosition) == 0;
+    }
     if (checkMacroSpace && (macroPosition == RXMACRO_SEARCH_BEFORE))
     {
         return getMacroSpaceRequires(activity, shortName, package, securityManager);
@@ -753,13 +806,14 @@ PackageClass *PackageManager::loadRequires(Activity *activity, RexxString *short
     // it's possible we don't have a file version of this
     if (resolvedName != OREF_NULL)
     {
-        resolvedName = manager->checkRequiresAccess(resolvedName, securityManager);
+        Protected<RexxString> checkedResolvedName = manager->checkRequiresAccess(resolvedName, securityManager);
         // no return means forbidden access to this name.  Just return
         // nothing
-        if (resolvedName == OREF_NULL)
+        if (checkedResolvedName.isNull())
         {
             return OREF_NULL;
         }
+        resolvedName = checkedResolvedName;
 
 
         // now check again using the longer name
@@ -857,11 +911,14 @@ PackageClass *PackageManager::loadRequires(Activity *activity, RexxString *name,
 
 
 /**
- * Loade a requires file from an in-store source.  NOTE:  This
- * is not cached like the other requires files
+ * Load a requires file from an in-store source.  The package is
+ * cached under its name like the other requires files, so that a
+ * later ::REQUIRES of that name finds it, but strongly: a file
+ * package that is garbage collected can be read again from its
+ * file, this one cannot.
  *
  * @param activity The current activity.
- * @param name     The fully resolved file name.
+ * @param name     The name given to the package.
  * @param result   The return routine object.
  *
  * @return The returned package instance.
@@ -879,8 +936,8 @@ PackageClass *PackageManager::loadRequires(Activity *activity, RexxString *name,
 
     package = LanguageParser::createPackage(name, buffer);
 
-    // cache the package instance
-    addToRequiresCache(name, package);
+    // cache the package instance, keeping it alive
+    addToRequiresCache(name, package, false);
     return package;
 }
 
@@ -897,10 +954,17 @@ PackageClass *PackageManager::checkRequiresCache(RexxString *name, Protected<Pac
     // first check this using the specified name.  Since we need to perform checks in the
     // macro space, it's possible this will be loaded under the simple name.  We'll need to check
     // table again using the fully resolved name afterward.
-    WeakReference *requiresRef = (WeakReference *)loadedRequires->get(name);
-    if (requiresRef != OREF_NULL)
+    RexxInternalObject *entry = loadedRequires->get(name);
+    if (entry != OREF_NULL)
     {
-        package = (PackageClass *)requiresRef->get();
+        // a package loaded from in-store data is held directly (see
+        // addToRequiresCache)
+        if (!isOfClass(WeakReference, entry))
+        {
+            package = (PackageClass *)entry;
+            return package;
+        }
+        package = (PackageClass *)((WeakReference *)entry)->get();
         if (!package.isNull())
         {
             return package;
@@ -917,15 +981,27 @@ PackageClass *PackageManager::checkRequiresCache(RexxString *name, Protected<Pac
  *
  * @param name    The name of the package.
  * @param package The package we're caching
+ * @param weak    true (the default): through a WeakReference, so
+ *                that an unused package can be collected (and
+ *                loaded again from its file when needed); false:
+ *                the package itself, for one that cannot be loaded
+ *                again (from in-store data).
  */
-void PackageManager::addToRequiresCache(RexxString *name, PackageClass *package)
+void PackageManager::addToRequiresCache(RexxString *name, PackageClass *package, bool weak)
 {
     // we place the code in the package table so we have
     // access to it to run the prologue code in other instances
     // We also add this before running the prolog in case another
     // thread tries to load the same thing.
-    WeakReference *ref = new WeakReference(package);
-    loadedRequires->put(ref, name);
+    if (weak)
+    {
+        WeakReference *ref = new WeakReference(package);
+        loadedRequires->put(ref, name);
+    }
+    else
+    {
+        loadedRequires->put(package, name);
+    }
 }
 
 

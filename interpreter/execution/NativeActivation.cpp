@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -542,6 +542,10 @@ void NativeActivation::processArguments(size_t _argcount, RexxObject **_arglist,
                             {
                                 reportStemError(inputIndex, argument);
                             }
+                            // the stem is held only through the caller's
+                            // variable, which the STRING method of a later
+                            // argument can drop: protect it for the call
+                            createLocalReference(stem);
                             descriptors[outputIndex].value.value_RexxStemObject = (RexxStemObject)stem;
                             break;
                         }
@@ -1142,6 +1146,8 @@ bool NativeActivation::objectToValue(RexxObject *o, ValueDescriptor *value)
             {
                 return false;
             }
+            // held only through the caller's variable: protect it
+            createLocalReference(stem);
             value->value.value_RexxStemObject = (RexxStemObject)stem;
             return true;
         }
@@ -1293,14 +1299,14 @@ void NativeActivation::run(MethodClass *_method, NativeMethod *_code, RexxObject
     // get the entry point address of the target method
     PNATIVEMETHOD methp = _code->getEntry();
 
-    // retrieve the argument signatures and process them
-    uint16_t *types = (*methp)((RexxMethodContext *)&context, NULL);
-    processArguments(argCount, argList, types, arguments, MaxNativeArguments);
-
     size_t activityLevel = activity->getActivationLevel();
     trapErrors = true;                       // we trap errors from here
     try
     {
+        // retrieve the argument signatures and process them here, so that an argument error is
+        // trapped by this activation, which is then removed from the stack like for any other error
+        uint16_t *types = (*methp)((RexxMethodContext *)&context, NULL);
+        processArguments(argCount, argList, types, arguments, MaxNativeArguments);
         activity->releaseAccess();           /* force this to "safe" mode         */
         /* process the method call           */
         (*methp)((RexxMethodContext *)&context, arguments);
@@ -1408,14 +1414,14 @@ void NativeActivation::callNativeRoutine(RoutineClass *_routine, NativeRoutine *
     // get the entry point address of the target method
     PNATIVEROUTINE methp = _code->getEntry();
 
-    // retrieve the argument signatures and process them
-    uint16_t *types = (*methp)((RexxCallContext *)&context, NULL);
-    processArguments(argCount, argList, types, arguments, MaxNativeArguments);
-
     size_t activityLevel = activity->getActivationLevel();
     trapErrors = true;                       // we trap error conditions now
     try
     {
+        // retrieve the argument signatures and process them here, so that an argument error is
+        // trapped by this activation, which is then removed from the stack like for any other error
+        uint16_t *types = (*methp)((RexxCallContext *)&context, NULL);
+        processArguments(argCount, argList, types, arguments, MaxNativeArguments);
         enableVariablepool();                // enable the variable pool interface here
         activity->releaseAccess();           // force this to "safe" mode
                                              // process the method call
@@ -1534,6 +1540,8 @@ void NativeActivation::callRegisteredRoutine(RoutineClass *_routine, RegisteredR
 
     size_t activityLevel = activity->getActivationLevel();
 
+    // set when an error ended the function: dealt with after the catch
+    bool ended = false;
     trapErrors = true;                       // trap errors from here
     try
     {
@@ -1579,6 +1587,14 @@ void NativeActivation::callRegisteredRoutine(RoutineClass *_routine, RegisteredR
         // nesting levels that will make it look like this activity is still in use
         // when in fact we're done with it.
         activity->restoreActivationLevel(activityLevel);
+        // finished below, out of the catch block (see callBack())
+        ended = true;
+    }
+    if (ended)
+    {
+        // an error that ended the function (a RexxCallBack call) is raised
+        // now, in the caller
+        checkConditions();
         activity->popStackFrame(this);   // pop this from the activity
         setHasNoReferences();        // mark this as not having references in case we get marked
         // set the return value and get outta here
@@ -1658,7 +1674,9 @@ void NativeActivation::run(ActivityDispatcher &dispatcher)
     // belt and braces...this restores the activity level to whatever
     // level we had when we made the callout.
     activity->restoreActivationLevel(activityLevel);
-    if (conditionObj != OREF_NULL)
+    // a condition RAISEd by the code we ran is not an error of the dispatch
+    // unit: Activity::run() hands it to the API caller (see trapRaised())
+    if (conditionObj != OREF_NULL && !calleeCondition)
     {
         // pass the condition information on to the dispatch unig
         dispatcher.handleError(conditionObj);
@@ -1710,8 +1728,9 @@ void NativeActivation::run(CallbackDispatcher &dispatcher)
     // belt and braces...this restores the activity level to whatever
     // level we had when we made the callout.
     activity->restoreActivationLevel(activityLevel);
-    // make sure we handle the error notifications
-    if (conditionObj != OREF_NULL)
+    // make sure we handle the error notifications (not a condition RAISEd
+    // by Rexx code the callback called: see trapRaised())
+    if (conditionObj != OREF_NULL && !calleeCondition)
     {
         // pass the condition information on to the dispatch unig
         dispatcher.handleError(conditionObj);
@@ -1760,8 +1779,9 @@ void NativeActivation::run(TrappingDispatcher &dispatcher)
     // belt and braces...this restores the activity level to whatever
     // level we had when we made the callout.
     activity->restoreActivationLevel(activityLevel);
-    // make sure we handle the error notifications
-    if (conditionObj != OREF_NULL)
+    // make sure we handle the error notifications (not a condition RAISEd
+    // by Rexx code the callback called: see trapRaised())
+    if (conditionObj != OREF_NULL && !calleeCondition)
     {
         // pass the condition information on to the dispatch unig
         dispatcher.handleError(conditionObj);
@@ -1776,7 +1796,11 @@ void NativeActivation::run(TrappingDispatcher &dispatcher)
  */
 void NativeActivation::accessCallerContext()
 {
-    activation = (RexxActivation *)getPreviousStackFrame();
+    // the caller is a Rexx activation only when Rexx code called us; a routine
+    // called by native code through CallRoutine has the dispatcher's native
+    // activation before it, and then there is no caller's context
+    ActivationBase *caller = getPreviousStackFrame();
+    activation = isOfClass(Activation, caller) ? (RexxActivation *)caller : OREF_NULL;
 }
 
 
@@ -1795,26 +1819,53 @@ void NativeActivation::checkConditions()
         // base of the stack, there's nothing left to handle this.
         if (!isStackBase())
         {
-            // syntax errors are fatal...we need to reraise this
-            if (conditionName->strCompare(GlobalNames::SYNTAX))
+            // syntax errors are fatal...we need to reraise this, and a
+            // thrown condition goes on in the same way (RFE #31)
+            if (Activity::isThrown(conditionName, conditionObj))
             {
                 // this prevents us from trying to trap this again
                 trapErrors = false;
                 activity->reraiseException(conditionObj);
             }
-            // some other condition (like NOTREADY)
-            else
+            // some other condition (like NOTREADY); one RAISEd by Rexx code
+            // we called stops here, as it would in a Rexx caller
+            else if (!calleeCondition)
             {
                 // find a predecessor Rexx activation
                 ActivationBase *_sender = getPreviousStackFrame();
                 // raise this in our caller's context.
+                bool trapped = false;
                 if (_sender != OREF_NULL)
                 {
-                    _sender->trap(conditionName, conditionObj);
+                    trapped = _sender->trap(conditionName, conditionObj);
+                }
+                // as with the RAISE instruction, an untrapped HALT or NOMETHOD
+                // condition is an error
+                if (!trapped)
+                {
+                    if (conditionName->strCompare(GlobalNames::HALT))
+                    {
+                        reportException(Error_Program_interrupted_condition, GlobalNames::HALT);
+                    }
+                    else if (conditionName->strCompare(GlobalNames::NOMETHOD))
+                    {
+                        RexxObject *additional = (RexxObject *)conditionObj->get(GlobalNames::ADDITIONAL);
+                        RexxObject *description = (RexxObject *)conditionObj->get(GlobalNames::DESCRIPTION);
+                        if (additional != OREF_NULL && description != OREF_NULL)
+                        {
+                            reportException(Error_No_method_name, additional, description);
+                        }
+                        reportException(Error_No_method_unhandled);
+                    }
                 }
                 // if the trap is not handled, then we return directly.  The return
-                // value (if any) is stored in the condition object
-                result = (RexxObject *)conditionObj->get(GlobalNames::RESULT);
+                // value (if any) is stored in the condition object; without one,
+                // the value the native code returned stands
+                RexxObject *conditionResult = (RexxObject *)conditionObj->get(GlobalNames::RESULT);
+                if (conditionResult != OREF_NULL)
+                {
+                    result = conditionResult;
+                }
             }
         }
     }
@@ -1832,7 +1883,7 @@ void NativeActivation::clearCondition()
     if (conditionObj != OREF_NULL)
     {
         // syntax errors need to be propagated, only clear other types
-        if (!conditionName->strCompare(GlobalNames::SYNTAX))
+        if (!Activity::isThrown(conditionName, conditionObj))
         {
             clearException();
         }
@@ -2631,8 +2682,9 @@ bool NativeActivation::trap(RexxString *condition, DirectoryClass *exception_obj
     // one so it can be raised in the caller's context.
 
     // we end up seeing this a second time if we're raising the exception on
-    // return from an external call or method.
-    if (condition->isEqual(GlobalNames::SYNTAX))
+    // return from an external call or method.  A thrown condition is held
+    // as an error is (RFE #31)
+    if (Activity::isThrown(condition, exception_object))
     {
         if (trapErrors)
         {
@@ -2680,6 +2732,51 @@ void NativeActivation::setConditionInfo(DirectoryClass *c)
     conditionObj = c;
     // we also need to retrieve the condition name from the object
     conditionName = (RexxString *)conditionObj->get(GlobalNames::CONDITION);
+    calleeCondition = false;
+}
+
+
+/**
+ * Set the condition information for a non-SYNTAX condition that Rexx
+ * code called from here raised with RAISE (see trapRaised()).  It is
+ * there for CheckCondition() and GetConditionInfo(), but it is not
+ * raised again when this activation returns.
+ *
+ * @param c      The condition object.
+ */
+void NativeActivation::setCalleeConditionInfo(DirectoryClass *c)
+{
+    setConditionInfo(c);
+    calleeCondition = !Activity::isThrown(conditionName, conditionObj);
+}
+
+
+/**
+ * A non-SYNTAX condition RAISEd by Rexx code this native activation
+ * called through the API (CallRoutine, SendMessage...).  RAISE offers it
+ * to its caller only.  Native code cannot trap it as Rexx code does, so
+ * it is not trapped (RAISE completes as for an untrapped condition), but
+ * it is kept for CheckCondition() and GetConditionInfo(), as a SYNTAX
+ * error is.  As in a Rexx caller, it goes no further: it is not raised
+ * again when this activation returns (RaiseCondition can do that).
+ *
+ * @param condition The condition name.
+ * @param conditionObject
+ *                  The condition object.
+ *
+ * @return true if trapped (only when an API call is raising a condition
+ *         itself, as trap() does), false otherwise.
+ */
+bool NativeActivation::trapRaised(RexxString *condition, DirectoryClass *conditionObject)
+{
+    // a condition raised through the API is handled as before
+    if (trapConditions)
+    {
+        return trap(condition, conditionObject);
+    }
+    setConditionInfo(condition, conditionObject);
+    calleeCondition = true;
+    return false;
 }
 
 
@@ -2847,6 +2944,12 @@ RexxObject* NativeActivation::getContextStem(RexxString *name)
     {
         return OREF_NULL;
     }
+    // a routine called by native code (through CallRoutine) has no caller's
+    // context, so there is no stem to resolve
+    if (activation == OREF_NULL)
+    {
+        return OREF_NULL;
+    }
     // get the variable value
     return retriever->getValue(activation);
 }
@@ -2877,6 +2980,11 @@ RexxObject* NativeActivation::getContextVariable(const char *name)
         // the value is the retriever
         return (RexxObject *)retriever;
     }
+    // no caller's context (a routine called through CallRoutine): no variables
+    else if (activation == OREF_NULL)
+    {
+        return OREF_NULL;
+    }
     else
     {
         // get the variable value
@@ -2905,6 +3013,12 @@ VariableReference *NativeActivation::getContextVariableReference(const char *nam
     // all next operations must be reset
     resetNext();
 
+    // no caller's context (a routine called through CallRoutine): no variables
+    if (activation == OREF_NULL)
+    {
+        return OREF_NULL;
+    }
+
     // get the reference. This will return NULL for all non-referencable
     // retriever types
     return retriever->getVariableReference(activation);
@@ -2929,6 +3043,12 @@ void NativeActivation::setContextVariable(const char *name, RexxObject *value)
     }
     resetNext();               // all next operations must be reset
 
+    // no caller's context (a routine called through CallRoutine): nothing to set
+    if (activation == OREF_NULL)
+    {
+        return;
+    }
+
     // do the assignment
     retriever->set(activation, value);
 }
@@ -2950,6 +3070,12 @@ void NativeActivation::dropContextVariable(const char *name)
     }
     resetNext();               // all next operations must be reset
 
+    // no caller's context (a routine called through CallRoutine): nothing to drop
+    if (activation == OREF_NULL)
+    {
+        return;
+    }
+
     // perform the drop
     retriever->drop(activation);
 }
@@ -2963,6 +3089,11 @@ void NativeActivation::dropContextVariable(const char *name)
 DirectoryClass *NativeActivation::getAllContextVariables()
 {
     resetNext();               // all next operations must be reset
+    // no caller's context (a routine called through CallRoutine): no variables
+    if (activation == OREF_NULL)
+    {
+        return new_directory();
+    }
     return activation->getAllLocalVariables();
 }
 
@@ -3169,8 +3300,9 @@ PackageClass *NativeActivation::getPackageObject()
  */
 RexxReturnCode NativeActivation::variablePoolInterface(PSHVBLOCK pshvblock)
 {
-    // this is not allowed asynchronously
-    if (!isVariablePoolEnabled())
+    // this is not allowed asynchronously, nor without a caller's context (a
+    // routine called through CallRoutine has none)
+    if (!isVariablePoolEnabled() || activation == OREF_NULL)
     {
         return RXSHV_NOAVL;
     }
@@ -3567,8 +3699,115 @@ int NativeActivation::stemSort(StemClass *stem, const char *tailExtension, int o
         tail = new_upper_string(tailExtension);
     }
 
-    // go perform the sort operation.
-    return stem->sort(tail, order, type, (size_t)start, (size_t)end, (size_t)firstcol, (size_t)lastcol);
+    // The sort reports its errors (an invalid stem.0, a missing element...) as
+    // SYNTAX errors.  This is a classic API, called without an ApiContext, and
+    // an earlier context API call has turned error trapping off on exit
+    // (ApiContext::~ApiContext), so turn it on for the sort: the error is then
+    // held here, as for any API call, and raised in the caller when the native
+    // code returns.  Untrapped, it would unwind this activation while the
+    // native code is still running on it.
+    bool wasTrapping = trapErrors;
+    trapErrors = true;
+    try
+    {
+        // go perform the sort operation.
+        bool sorted = stem->sort(tail, order, type, (size_t)start, (size_t)end, (size_t)firstcol, (size_t)lastcol);
+        trapErrors = wasTrapping;
+        return sorted;
+    }
+    catch (NativeActivation *)
+    {
+        trapErrors = wasTrapping;
+        return false;
+    }
+}
+
+
+/**
+ * RexxCallBack: call a label of the Rexx program that called this native
+ * code, as an internal function call from the clause that called it.
+ *
+ * @return The RexxCallBack return code.
+ */
+int NativeActivation::callBack(const char *name, size_t argc, PCONSTRXSTRING argv, short *returnCode, PRXSTRING retstr)
+{
+    // as in Regina, the numeric result is 0 unless the call returns one
+    if (returnCode != NULL)
+    {
+        *returnCode = 0;
+    }
+    RexxActivation *caller = findRexxContext();
+    if (caller == OREF_NULL)
+    {
+        return RX_CB_NOTSTARTED;
+    }
+    // labels are not case-sensitive here, as in Regina
+    Protected<RexxString> label = new_upper_string(name);
+    StringTable *labels = caller->getLabels();
+    RexxInstruction *target = labels == OREF_NULL ? OREF_NULL : (RexxInstruction *)labels->get(label);
+    if (target == OREF_NULL)
+    {
+        return RX_CB_BADN;
+    }
+
+    Protected<ArrayClass> args = new_array(argc);
+    for (size_t i = 0; i < argc; i++)
+    {
+        if (argv[i].strptr != NULL)
+        {
+            args->put(new_string(argv[i]), i + 1);
+        }
+    }
+
+    // A SYNTAX error of the call ends the native code, as in Regina (an
+    // event loop waiting for its callbacks would never return): it is held
+    // here, and this activation is thrown through the native code to the
+    // routine call that started it, which raises the error in the caller.
+    // Error trapping must be on for that: this is a classic API, called
+    // without an ApiContext, and an earlier context API call may have turned
+    // it off (see stemSort); untrapped, the error would unwind the caller's
+    // frames while the native code is still running on them.
+    ProtectedObject callResult;
+    bool wasTrapping = trapErrors;
+    trapErrors = true;
+    bool failed = false;
+    try
+    {
+        caller->internalCall(label, target, args->messageArgs(), argc, callResult);
+    }
+    catch (NativeActivation *)
+    {
+        failed = true;
+    }
+    trapErrors = wasTrapping;
+    // thrown again out of the catch block: with MSVC a catch block runs on top
+    // of the frames it caught from, so a throw inside it keeps them all, and
+    // deep recursion through RexxCallBack overflows the stack
+    if (failed)
+    {
+        throw this;
+    }
+
+    RexxObject *value = callResult;
+    if (value == OREF_NULL)
+    {
+        if (retstr != NULL)
+        {
+            retstr->strptr = NULL;
+            retstr->strlength = 0;
+        }
+        return RX_CB_OK;
+    }
+    Protected<RexxString> text = value->requestString();
+    if (returnCode != NULL)
+    {
+        *returnCode = (short)atoi(text->getStringData());
+    }
+    if (retstr != NULL)
+    {
+        text->copyToRxstring(*retstr);
+    }
+    return RX_CB_OK;
 }
 
 

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -267,12 +267,13 @@ char *REXXENTRY RexxGetVersionInformation()
     char copy3[] = "\nThis program and the accompanying materials are made available under the terms";
     char copy4[] = "\nof the Common Public License v1.0 which accompanies this distribution or at";
     char copy5[] = "\nhttps://www.oorexx.org/license.html";
-    size_t length = strlen(header) + strlen(ver) + strlen(build) + strlen(__DATE__) +
+    const char *date = Interpreter::getBuildDate();
+    size_t length = strlen(header) + strlen(ver) + strlen(build) + strlen(date) +
         strlen(mode) + strlen(copy1) + strlen(copy2) + strlen(copy3) + strlen(copy4) + strlen(copy5) + 1;
     char *ptr = (char *)SystemInterpreter::allocateResultMemory(length);
     if (ptr != NULL)
     {
-        snprintf(ptr, length, "%s%s%s%s%s%s%s%s%s%s", header, ver, build, __DATE__, mode, copy1, copy2, copy3, copy4, copy5);
+        snprintf(ptr, length, "%s%s%s%s%s%s%s%s%s%s", header, ver, build, date, mode, copy1, copy2, copy3, copy4, copy5);
     }
     return ptr;
 }
@@ -411,6 +412,48 @@ RexxReturnCode RexxEntry RexxVariablePool(PSHVBLOCK pshvblock)
     // the variable pool interface handles its own try/catches.
     return context.self->variablePoolInterface(pshvblock);
 }
+
+/**
+ * Call a label of the running Rexx program as an internal function, from
+ * native code running on the program's thread (an external function, in
+ * practice), as Regina's RexxCallBack.
+ *
+ * @param name       The label (not case-sensitive).
+ * @param argc       The number of arguments.
+ * @param argv       The arguments (a NULL strptr is an omitted argument).
+ * @param returnCode Optional: the result as a number (atoi), 0 without one.
+ * @param result     Optional: the result.  The buffer is used if it is large
+ *                   enough, otherwise a new one is allocated with
+ *                   RexxAllocateMemory; NULL strptr if there is no result.
+ *
+ * @return RX_CB_OK, RX_CB_BADP, RX_CB_NOTSTARTED (no Rexx program is running on
+ *         this thread) or RX_CB_BADN (no such label).  An error in the call,
+ *         as an EXIT, does not return: it ends the native code, as in Regina,
+ *         and is raised in the program at the clause that called it.
+ */
+RexxReturnCode RexxEntry RexxCallBack(CONSTANT_STRING name, size_t argc, PCONSTRXSTRING argv, short *returnCode, PRXSTRING result)
+{
+    if (name == NULL || (argc > 0 && argv == NULL))
+    {
+        return RX_CB_BADP;
+    }
+    // unlike the other classic APIs, this never starts an interpreter
+    // instance: it is only meaningful inside a running program
+    Activity *activity = ActivityManager::getActivity();
+    if (activity == OREF_NULL)
+    {
+        return RX_CB_NOTSTARTED;
+    }
+    RexxReturnCode rc = RX_CB_NOTSTARTED;
+    ActivationBase *top = activity->getTopStackFrame();
+    if (isOfClass(NativeActivation, top))
+    {
+        rc = ((NativeActivation *)top)->callBack(name, argc, argv, returnCode, result);
+    }
+    activity->exitCurrentThread();
+    return rc;
+}
+
 
 /**
  * Process a stemsort call for the rexxutil SysStemSort function.

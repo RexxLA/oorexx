@@ -1,6 +1,6 @@
 #/*----------------------------------------------------------------------------*/
 #/*                                                                            */
-#/* Copyright (c) 2014-2025 Rexx Language Association. All rights reserved.    */
+#/* Copyright (c) 2014-2026 Rexx Language Association. All rights reserved.    */
 #/*                                                                            */
 #/* This program and the accompanying materials are made available under       */
 #/* the terms of the Common Public License v1.0 which accompanies this         */
@@ -65,6 +65,17 @@ generate_test_library(orxfunction cpp)
 generate_test_library(orxmethod cpp)
 generate_test_library(orxclassic cpp)
 generate_test_library(orxclassic1 c def)
+# TestCallBackThread starts a thread
+if (NOT WIN32)
+   find_package(Threads REQUIRED)
+   target_link_libraries(orxclassic1 Threads::Threads)
+endif ()
+# An error in a RexxCallBack call ends TestCallBack by unwinding through it,
+# which needs unwind tables in this C code: 32-bit ARM does not generate
+# them by default, and the process aborts (std::terminate)
+if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+   target_compile_options(orxclassic1 PRIVATE -funwind-tables)
+endif ()
 
 
 # this library is linked to other test libraries
@@ -100,4 +111,32 @@ target_include_directories(rexxinstance PUBLIC
             ${build_api_platform_dir})
 # Extra link library definitions
 target_link_libraries(rexxinstance orxexits rexx rexxapi)
+
+# Creates and terminates interpreter instances from several threads at once.
+# Not driven by the test framework: it has to run as its own process, because
+# what it exercises is process-wide interpreter startup. See the file header.
+add_executable(provoke_locks
+   ${PROJECT_SOURCE_DIR}/provoke_locks.cpp)
+# Include file definition
+target_include_directories(provoke_locks PUBLIC
+            ${build_api_dir}
+            ${build_api_platform_dir})
+# Extra link library definitions
+find_package(Threads REQUIRED)
+target_link_libraries(provoke_locks rexx rexxapi ${CMAKE_THREAD_LIBS_INIT})
+# the Rexx program it drives has to sit next to the executable
+configure_file(${PROJECT_SOURCE_DIR}/provoke_locks.rex
+               ${CMAKE_BINARY_DIR}/bin/provoke_locks.rex COPYONLY)
+
+# Terminate() after the creating thread called DetachThread() (bug #2107).
+# Run by ProcessInvocation.testGroup as its own process, with a watchdog,
+# so that a hang fails the test instead of stopping the test suite.
+add_executable(detach_root_terminate
+   ${PROJECT_SOURCE_DIR}/detach_root_terminate.cpp)
+# Include file definition
+target_include_directories(detach_root_terminate PUBLIC
+            ${build_api_dir}
+            ${build_api_platform_dir})
+# Extra link library definitions
+target_link_libraries(detach_root_terminate rexx rexxapi ${CMAKE_THREAD_LIBS_INIT})
 

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -239,6 +239,7 @@ class LanguageParser: public RexxInternalObject
            bool isExposed(RexxString *varName);
     void captureGuardVariable(RexxString *varname, RexxVariableBase *retriever);
     void requireLanguageLevel(LanguageLevel l);
+    void requireBuiltinLanguageLevel(size_t builtin, size_t argCount);
     static bool canExecute(LanguageLevel l);
 
     // instruction parsing methods
@@ -285,11 +286,14 @@ class LanguageParser: public RexxInternalObject
     RexxInstruction *numericNew();
     RexxInstruction *optionsNew();
     RexxInstruction *otherwiseNew(RexxToken *);
+    RexxInstruction *catchNew();
+    RexxInstruction *finallyNew(RexxToken *);
+    void checkFinallyExit(const char *keyword, bool blockTarget = false, RexxString *name = OREF_NULL);
     RexxInstruction *parseNew(InstructionSubKeyword);
     RexxInstruction *procedureNew();
     RexxInstruction *pushNew();
     RexxInstruction *queueNew();
-    RexxInstruction *raiseNew();
+    RexxInstruction *raiseNew(bool isThrow);
     RexxInstruction *replyNew();
     RexxInstruction *returnNew();
     RexxInstruction *sayNew();
@@ -343,6 +347,7 @@ class LanguageParser: public RexxInternalObject
     void        createConstantGetterMethod(RexxString *name, RexxObject *value, RexxInternalObject *expression, SourceLocation &location);
     void        createAbstractMethod(RexxString *name, bool classMethod, AccessFlag privateMethod, ProtectedFlag protectedMethod, GuardFlag guardedMethod, bool isAttribute);
     void        checkDuplicateMethod(RexxString *name, bool classMethod, RexxErrorCodes errorMsg);
+    void        checkSubkeyword(const char *directive, RexxToken *&previous, RexxToken *token);
     void        addMethod(RexxString *name, MethodClass *method, bool classMethod);
     bool        isDuplicateClass(RexxString *name);
     bool        isDuplicateRoutine(RexxString *name);
@@ -471,6 +476,8 @@ protected:
     size_t lineCount;                    // count of lines in the source
     RexxClause *clause;                  // current clause being created
     SourceLocation clauseLocation;       // current clause location for errors
+    SourceLocation lastForward;          // the last FORWARD without CONTINUE (RFE #31)
+    bool hasForward;                     // there has been one
     size_t lineNumber;                   // current line position
     size_t lineOffset;                   // current offset with in the line
 

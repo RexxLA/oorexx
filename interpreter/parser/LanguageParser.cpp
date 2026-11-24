@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -62,6 +62,8 @@
 #include "EndInstruction.hpp"
 #include "DoInstruction.hpp"
 #include "OtherwiseInstruction.hpp"
+#include "CatchInstruction.hpp"
+#include "FinallyInstruction.hpp"
 #include "CallInstruction.hpp"
 #include "ExpressionFunction.hpp"
 #include "ExpressionVariable.hpp"
@@ -480,6 +482,7 @@ LanguageParser::LanguageParser(RexxString *n, ProgramSource *s)
     // more objects until we start parsing.
     name = n;
     source = s;
+    hasForward = false;
 }
 
 
@@ -654,6 +657,8 @@ RoutineClass *LanguageParser::generateProgram(PackageClass *sourceContext)
 {
     // initialize, and compile all of the source.
     compileSource();
+    // override of program/package setting, if enabled
+    PackageClass::overridePackageSettings(package);
     // get the main section of the source package and make a method
     // object from it.  This is the package "main" executable.
     package->mainExecutable = new RoutineClass(name, mainSection);
@@ -812,6 +817,46 @@ void LanguageParser::requireLanguageLevel(LanguageLevel l)
 
 
 /**
+ * Mark the package as requiring the language level at which a
+ * builtin function, or the form of the call to it, was introduced,
+ * if it is newer than the base level.  Called once we know that a
+ * call or function reference resolves to this builtin.
+ *
+ * @param builtin  The builtin function index.
+ * @param argCount The number of arguments of the call.
+ */
+void LanguageParser::requireBuiltinLanguageLevel(size_t builtin, size_t argCount)
+{
+    switch (builtin)
+    {
+        // new in 5.2.0
+        case BUILTIN_GC:
+            requireLanguageLevel(LanguageLevel0606);
+            break;
+
+        // built-in functions since 5.3.0 (routines of the REXX package
+        // before): an older interpreter has no code for them
+        case BUILTIN_BEEP:
+        case BUILTIN_DIRECTORY:
+        case BUILTIN_FILESPEC:
+            requireLanguageLevel(LanguageLevel0607);
+            break;
+
+        // the second argument is new in 5.3.0
+        case BUILTIN_ERRORTEXT:
+            if (argCount > 1)
+            {
+                requireLanguageLevel(LanguageLevel0607);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+/**
  * Test if this version of the interpreter can handle
  * executing a program created with a given language level.
  *
@@ -850,6 +895,8 @@ void LanguageParser::initializeForDirectives()
  */
 void LanguageParser::installPackage()
 {
+    // override of program/package setting, if enabled
+    PackageClass::overridePackageSettings(package);
     package->install();
 }
 
@@ -1227,7 +1274,9 @@ RexxCode *LanguageParser::translateBlock()
             bool withinIf = type == KEYWORD_IFTHEN || type == KEYWORD_ELSE;
             bool withinSelect = type == KEYWORD_SELECT || type == KEYWORD_SELECT_CASE ||
                                 type == KEYWORD_WHENTHEN || type == KEYWORD_ENDWHEN || type == KEYWORD_OTHERWISE;
-            if (topDo()->isControl() || withinIf || withinSelect)
+            // a CATCH clause is part of its DO, LOOP or SELECT (RFE #31)
+            bool withinCatch = type == KEYWORD_CATCH || type == KEYWORD_FINALLY;
+            if (topDo()->isControl() || withinIf || withinSelect || withinCatch)
             {
                 // get our label name
                 resetPosition(1); // firstToken() won't do ..
@@ -1295,11 +1344,56 @@ RexxCode *LanguageParser::translateBlock()
         // any pending control levels.
         else if (type != KEYWORD_ELSE)
         {
+            // an END cannot be the instruction of a pending THEN or ELSE.
+            // This must be checked here: flushControl() would add the END
+            // as that instruction, and the END case below would then find
+            // something else at the top of the control stack.
+            if (type == KEYWORD_END)
+            {
+                InstructionKeyword pending = topDoType();
+                if (pending == KEYWORD_ELSE)
+                {
+                    syntaxError(Error_Unexpected_end_else);
+                }
+                else if (pending == KEYWORD_IFTHEN || pending == KEYWORD_WHENTHEN)
+                {
+                    syntaxError(Error_Unexpected_end_then);
+                }
+            }
+            // nor can a CATCH clause (RFE #31): after an ELSE, flushControl()
+            // would add it as the instruction of the ELSE, and the CATCH case
+            // below would then find the enclosing block and accept it
+            else if (type == KEYWORD_CATCH)
+            {
+                InstructionKeyword pending = topDoType();
+                if (pending == KEYWORD_ELSE)
+                {
+                    syntaxError(Error_Unexpected_end_catch_else);
+                }
+                else if (pending == KEYWORD_IFTHEN || pending == KEYWORD_WHENTHEN)
+                {
+                    syntaxError(Error_Unexpected_end_catch_then);
+                }
+            }
+            // nor a FINALLY clause
+            else if (type == KEYWORD_FINALLY)
+            {
+                InstructionKeyword pending = topDoType();
+                if (pending == KEYWORD_ELSE)
+                {
+                    syntaxError(Error_Unexpected_end_finally_else);
+                }
+                else if (pending == KEYWORD_IFTHEN || pending == KEYWORD_WHENTHEN)
+                {
+                    syntaxError(Error_Unexpected_end_finally_then);
+                }
+            }
             flushControl(instruction);
         }
         // validate allowed instructions in a SELECT
         if (topDoIsType(KEYWORD_SELECT, KEYWORD_SELECT_CASE) &&
-            (type != KEYWORD_WHEN && type != KEYWORD_WHEN_CASE && type != KEYWORD_OTHERWISE && type != KEYWORD_END))
+            (type != KEYWORD_WHEN && type != KEYWORD_WHEN_CASE && type != KEYWORD_OTHERWISE && type != KEYWORD_END &&
+             type != KEYWORD_CATCH && type != KEYWORD_FINALLY))
         {
             syntaxError(Error_When_expected_whenotherwise, topDo());
         }
@@ -1320,6 +1414,14 @@ RexxCode *LanguageParser::translateBlock()
                 {
                     // let the select know that another WHEN was added
                     ((RexxInstructionSelect *)second)->addWhen((RexxInstructionIf *)instruction);
+                }
+                // anything else on top means this WHEN has been taken as the
+                // instruction of a THEN (e.g. "when a then" followed by
+                // "when b then ...").  It belongs to no SELECT, so it is an error,
+                // just like an OTHERWISE in the same position.
+                else
+                {
+                    syntaxError(Error_Unexpected_when_when);
                 }
             }
 
@@ -1496,6 +1598,82 @@ RexxCode *LanguageParser::translateBlock()
                 break;
             }
 
+                // A CATCH clause of a DO, LOOP or SELECT (RFE #31).  It follows the
+                // body, or the code of the previous CATCH clause, and lasts until
+                // the next CATCH clause or the END.
+                // A FINALLY clause is one more clause of the same chain, the last one.
+            case  KEYWORD_CATCH:
+            case  KEYWORD_FINALLY:
+            {
+                RexxInstructionCatch *clause = (RexxInstructionCatch *)instruction;
+                RexxInstruction *second = topDo();
+                RexxBlockInstruction *owner;
+                // nothing follows the FINALLY clause of a block but its END
+                if (second->isType(KEYWORD_FINALLY))
+                {
+                    syntaxError(Error_Unexpected_end_after_finally, new_integer(second->getLineNumber()));
+                }
+                // another clause of the same block
+                if (second->isType(KEYWORD_CATCH))
+                {
+                    popDo();
+                    RexxInstructionCatch *previous = (RexxInstructionCatch *)second;
+                    owner = previous->getOwner();
+                    previous->setNextCatch(clause);
+                    clause->setFirstCatch(previous->getFirstCatch());
+                }
+                else
+                {
+                    // after the OTHERWISE of a SELECT, the clause belongs to the SELECT
+                    if (second->isType(KEYWORD_OTHERWISE))
+                    {
+                        popDo();
+                        second = topDo();
+                    }
+                    // a block instruction other than OTHERWISE is a DO, LOOP or SELECT;
+                    // anything else (no block at all) is an error.  A pending THEN
+                    // or ELSE has already been rejected, before flushControl()
+                    if (!second->isBlock() || second->isType(KEYWORD_OTHERWISE))
+                    {
+                        syntaxError(type == KEYWORD_FINALLY ? Error_Unexpected_end_finally : Error_Unexpected_end_catch);
+                    }
+                    owner = (RexxBlockInstruction *)second;
+                    clause->setFirstCatch(clause);
+                }
+                clause->setOwner(owner);
+                // a FORWARD without CONTINUE ends the method at once, and a
+                // FINALLY clause needs it to go on: it must not be in a block
+                // that has one, at any depth.  Blocks nest, so any FORWARD
+                // after the start of this block is inside it
+                if (type == KEYWORD_FINALLY && hasForward)
+                {
+                    SourceLocation start = owner->getLocation();
+                    if (lastForward.getLineNumber() > start.getLineNumber() ||
+                        (lastForward.getLineNumber() == start.getLineNumber() && lastForward.getOffset() > start.getOffset()))
+                    {
+                        syntaxError(Error_Translation_forward_finally, new_integer(lastForward.getLineNumber()));
+                    }
+                }
+                // the clause stays on the control stack until the next one or the END
+                pushDo(clause);
+
+                // FINALLY implies a semicolon after it, as OTHERWISE does: an
+                // instruction may follow on the same line.  (CATCH is followed by
+                // its conditions, which catchNew() has parsed to the end of the clause.)
+                if (type == KEYWORD_FINALLY)
+                {
+                    RexxToken *token = nextReal();
+                    if (!token->isEndOfClause())
+                    {
+                        previousToken();
+                        trimClause();
+                        // we have a clause, go back around and process this
+                        continue;
+                    }
+                }
+                break;
+            }
+
                 // An END instruction.  This could be the closure for a DO, LOOP, or SELECT.
                 // its matchup should be on the top of the control stack.
             case  KEYWORD_END:
@@ -1504,6 +1682,14 @@ RexxCode *LanguageParser::translateBlock()
                 // correct type, we're finished with this.  If not the
                 // correct type, we have an error.
                 RexxInstruction *second = popDo();
+                // the END of a block with CATCH clauses: the last clause is on top,
+                // its block below it (RFE #31)
+                RexxInstructionCatch *lastCatch = OREF_NULL;
+                if (second->isType(KEYWORD_CATCH) || second->isType(KEYWORD_FINALLY))
+                {
+                    lastCatch = (RexxInstructionCatch *)second;
+                    second = popDo();
+                }
                 type = second->getType();
                 // that the top of the stack is an acceptable block-type instruction.
                 // This includes all of the DO/LOOP variants, both Select types, and Otherwise
@@ -1544,6 +1730,19 @@ RexxCode *LanguageParser::translateBlock()
                 else                           /* must be a DO block                */
                 {
                     ((RexxBlockInstruction *)second)->matchEnd((RexxInstructionEnd *)instruction, this);
+                }
+
+                // a block with CATCH clauses: the clauses do what the END would have
+                // done when the body runs into them, and the END ends the block
+                if (lastCatch != OREF_NULL)
+                {
+                    RexxInstructionEnd *end = (RexxInstructionEnd *)instruction;
+                    for (RexxInstructionCatch *clause = lastCatch->getFirstCatch(); clause != OREF_NULL;
+                         clause = clause->getNextCatch())
+                    {
+                        clause->setOwnerStyle(end->getStyle());
+                    }
+                    end->setStyle(CATCH_BLOCK);
                 }
 
                 // We've just completed a large block instruction.  It is possible that
@@ -1699,11 +1898,13 @@ void LanguageParser::resolveCalls()
         if (isOfClass(FunctionCallTerm, instruction))
         {
             ((RexxExpressionFunction *)instruction)->resolve(labels);
+            requireBuiltinLanguageLevel(((RexxExpressionFunction *)instruction)->resolvedBuiltin(), ((RexxExpressionFunction *)instruction)->getArgumentCount());
         }
         else
         {
             // ok, technically, this could be either a CALL or a SIGNAL.
             ((RexxInstructionCallBase *)instruction)->resolve(labels);
+            requireBuiltinLanguageLevel(((RexxInstructionCallBase *)instruction)->resolvedBuiltin(), ((RexxInstructionCallBase *)instruction)->getArgumentCount());
         }
     }
 }
@@ -2124,8 +2325,11 @@ RexxCompoundVariable *LanguageParser::addCompound(RexxString *name)
 {
     // we cache compound variables also...see if we've encountered
     // this exact name before.
+    // (Not while parsing a GUARD WHEN expression: the stem and the tails
+    // must go through the guard variable capture again, which happens
+    // when the retriever is built.)
     RexxCompoundVariable *retriever = (RexxCompoundVariable *)(variables->get(name));
-    if (retriever != OREF_NULL)
+    if (retriever != OREF_NULL && !capturingGuardVariables())
     {
         return retriever;
     }
@@ -2200,7 +2404,10 @@ RexxCompoundVariable *LanguageParser::addCompound(RexxString *name)
     // variables table for this.
     variables->put(retriever, name);
 
-    // NOTE: compound variables do get added to the guard list.
+    // in a GUARD WHEN expression, watch the compound variable itself too:
+    // assigning or dropping it does not change the stem variable, which is
+    // all that addStem() adds.  It is exposed if its stem is.
+    captureGuardVariable(stemName, retriever);
     return retriever;
 }
 
@@ -3240,6 +3447,11 @@ RexxInternalObject *LanguageParser::parseFunction(RexxToken *token, RexxToken *n
     {
         addReference(func);
     }
+    // a literal name always calls the builtin, if there is one
+    else
+    {
+        requireBuiltinLanguageLevel(name->builtin(), argCount);
+    }
     return func;
 }
 
@@ -3614,7 +3826,7 @@ RexxInternalObject* LanguageParser::parseMessageSubterm(int terminators)
 {
     // with very complex instructions, it is possible to recurse quite deeply here.
     // so give a look at the stack space on each call so we can terminate "nicely"
-    ActivityManager::currentActivity->checkStackSpace();
+    ActivityManager::currentActivity.load()->checkStackSpace();
     // get the first token.  If we've hit a terminator here, this could be
     // the real end of the expression.  The caller context will figure out
     // how to handle that.
@@ -3754,7 +3966,7 @@ RexxInternalObject* LanguageParser::parseSubTerm(int terminators)
 {
     // with very complex instructions, it is possible to recurse quite deeply here.
     // so give a look at the stack space on each call so we can terminate "nicely"
-    ActivityManager::currentActivity->checkStackSpace();
+    ActivityManager::currentActivity.load()->checkStackSpace();
 
     // get the first token and make sure we really have something here.
     // The caller knows how to deal with a missing term.
@@ -4064,7 +4276,7 @@ ArrayClass  *LanguageParser::words(RexxString *string)
  */
 void LanguageParser::error(RexxErrorCodes errorcode)
 {
-    ActivityManager::currentActivity->raiseException(errorcode, OREF_NULL, OREF_NULL, OREF_NULL);
+    ActivityManager::currentActivity.load()->raiseException(errorcode, OREF_NULL, OREF_NULL, OREF_NULL);
 }
 
 
@@ -4081,7 +4293,7 @@ void LanguageParser::error(RexxErrorCodes errorcode, const SourceLocation &locat
     // set the error location.  This location is picked up from the
     // parse context stack frame we set up before we started
     clauseLocation = location;
-    ActivityManager::currentActivity->raiseException(errorcode, OREF_NULL, subs, OREF_NULL);
+    ActivityManager::currentActivity.load()->raiseException(errorcode, OREF_NULL, subs, OREF_NULL);
 }
 
 
@@ -4096,7 +4308,7 @@ void LanguageParser::error(RexxErrorCodes errorcode, const SourceLocation &locat
  */
 void LanguageParser::errorLine(RexxErrorCodes errorcode, RexxInstruction *instruction)
 {
-    ActivityManager::currentActivity->raiseException(errorcode, OREF_NULL, new_array(new_integer(instruction->getLineNumber())), OREF_NULL);
+    ActivityManager::currentActivity.load()->raiseException(errorcode, OREF_NULL, new_array(new_integer(instruction->getLineNumber())), OREF_NULL);
 }
 
 
@@ -4111,7 +4323,7 @@ void LanguageParser::errorPosition(RexxErrorCodes errorcode, RexxToken *token )
 {
     SourceLocation tokenLocation = token->getLocation();
 
-    ActivityManager::currentActivity->raiseException(errorcode, OREF_NULL, new_array(new_integer(tokenLocation.getOffset() + 1), new_integer(tokenLocation.getLineNumber())), OREF_NULL);
+    ActivityManager::currentActivity.load()->raiseException(errorcode, OREF_NULL, new_array(new_integer(tokenLocation.getOffset() + 1), new_integer(tokenLocation.getLineNumber())), OREF_NULL);
 }
 
 
@@ -4124,7 +4336,7 @@ void LanguageParser::errorPosition(RexxErrorCodes errorcode, RexxToken *token )
  */
 void LanguageParser::errorToken(RexxErrorCodes errorcode, RexxToken *token )
 {
-    ActivityManager::currentActivity->raiseException(errorcode, OREF_NULL, new_array(token->displayValue()), OREF_NULL);
+    ActivityManager::currentActivity.load()->raiseException(errorcode, OREF_NULL, new_array(token->displayValue()), OREF_NULL);
 }
 
 
@@ -4136,7 +4348,7 @@ void LanguageParser::errorToken(RexxErrorCodes errorcode, RexxToken *token )
  */
 void LanguageParser::error(RexxErrorCodes errorcode, RexxObject *value )
 {
-    ActivityManager::currentActivity->raiseException(errorcode, OREF_NULL, new_array(value), OREF_NULL);
+    ActivityManager::currentActivity.load()->raiseException(errorcode, OREF_NULL, new_array(value), OREF_NULL);
 }
 
 
@@ -4149,7 +4361,7 @@ void LanguageParser::error(RexxErrorCodes errorcode, RexxObject *value )
  */
 void LanguageParser::error(RexxErrorCodes errorcode, RexxObject *value1, RexxObject *value2 )
 {
-    ActivityManager::currentActivity->raiseException(errorcode, OREF_NULL, new_array(value1, value2), OREF_NULL);
+    ActivityManager::currentActivity.load()->raiseException(errorcode, OREF_NULL, new_array(value1, value2), OREF_NULL);
 }
 
 
@@ -4163,7 +4375,7 @@ void LanguageParser::error(RexxErrorCodes errorcode, RexxObject *value1, RexxObj
  */
 void LanguageParser::error(RexxErrorCodes errorcode, RexxObject *value1, RexxObject *value2, RexxObject *value3 )
 {
-    ActivityManager::currentActivity->raiseException(errorcode, OREF_NULL, new_array(value1, value2, value3), OREF_NULL);
+    ActivityManager::currentActivity.load()->raiseException(errorcode, OREF_NULL, new_array(value1, value2, value3), OREF_NULL);
 }
 
 
@@ -4223,6 +4435,12 @@ void LanguageParser::blockError(RexxInstruction *instruction)
         // OTHERWISE section of a SELECT
         case KEYWORD_OTHERWISE:
             syntaxError(Error_Incomplete_do_otherwise, instruction);
+            break;
+
+        // CATCH or FINALLY clause: the error is the one of its block
+        case KEYWORD_CATCH:
+        case KEYWORD_FINALLY:
+            blockError(((RexxInstructionCatch *)instruction)->getOwner());
             break;
 
         // different variants of an IF
@@ -4330,9 +4548,14 @@ RoutineClass *LanguageParser::processInstore(PRXSTRING instore, RexxString * nam
     if (instore[0].strptr == NULL && instore[1].strptr == NULL)
     {
         unsigned short temp;
+        int rc;
+        {
+            UnsafeBlock releaser;   // don't hold the kernel lock while asking rxapi
+            rc = RexxQueryMacro(name->getStringData(), &temp);
+        }
 
         // see if this exists
-        if (!RexxQueryMacro(name->getStringData(), &temp))
+        if (rc == 0)
         {
             return restoreFromMacroSpace(name);
         }
@@ -4385,7 +4608,10 @@ RoutineClass *LanguageParser::restoreFromMacroSpace(RexxString *name)
 
     MAKERXSTRING(buffer, NULL, 0);
     // get the image of function
-    RexxResolveMacroFunction(name->getStringData(), &buffer);
+    {
+        UnsafeBlock releaser;       // don't hold the kernel lock while asking rxapi
+        RexxResolveMacroFunction(name->getStringData(), &buffer);
+    }
     // unflatten the method now
     Protected<RoutineClass> routine = RoutineClass::restore(&buffer, name);
     // release the buffer memory

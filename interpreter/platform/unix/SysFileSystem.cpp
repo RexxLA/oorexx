@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -78,89 +78,6 @@ const char SysFileSystem::CarriageReturn = '\r';
 // .DateTime~new(1970, 1, 1) - .DateTime~new(1, 1, 1)~totalSeconds
 const int64_t StatEpoch = 62135596800;           // seconds between 0001-01-01 and 1970-01-01
 const int64_t NoTimeStamp = -999999999999999999; // invalid file time
-
-/**
- * Search for a given filename, returning the fully
- * resolved name if it is found.
- *
- * @param name     The original name.
- * @param fullName A pointer to the buffer where the resolved name is returned.
- *
- * @return True if the file was found, false otherwise.
- */
-bool SysFileSystem::searchFileName(const char *name, FileNameBuffer &fullName)
-{
-    size_t nameLength = strlen(name);
-
-    /* does the filename already have a path? */
-    /* or does it start with "~" ? */
-    /* (beware, don't test "." because files like ".hidden" alone are candidate for search in PATH */
-    if (strstr(name, "/") != NULL || name[0] == '~' || name[0] == '.')
-    {
-        bool done = canonicalizeName(fullName);
-        if (done == false || fileExists(fullName) == false)
-        {
-            fullName.at(0) = '\0';
-            return false;
-        }
-        return true;
-    }
-
-    // Get the current working directory
-    if (!getCurrentDirectory(fullName))
-    {
-        return false;
-    }
-    // now add on to the front of the name
-    fullName += '/';
-    fullName += name;
-
-    // if the file exists, then return it
-    if (fileExists(fullName))
-    {
-        return true;
-    }
-
-    // it was not in the current directory so search the PATH
-    const char *currentPath = getenv("PATH");
-    if (currentPath == NULL)
-    {
-        fullName = "";
-        return false;
-    }
-
-    const char *sep = strchr(currentPath, ':');
-    while (sep != NULL)
-    {
-        /* try each entry in the PATH */
-        int i = sep - currentPath;
-        fullName.set(currentPath, i);
-        fullName += '/';
-        fullName += name;
-        if (fileExists(fullName) == true)
-        {
-            return true;
-        }
-        currentPath = sep + 1;
-        sep = strchr(currentPath, ':');
-    }
-
-    /* the last entry in the PATH might not be terminated by a colon */
-    if (*currentPath != '\0')
-    {
-        fullName = currentPath;
-        fullName += currentPath;
-        fullName += name;
-        if (fileExists(fullName) == true)
-        {
-            return true;
-        }
-    }
-
-    // not found, return a null string
-    fullName = "";
-    return false;
-}
 
 
 /**
@@ -356,9 +273,10 @@ bool SysFileSystem::hasDirectory(const char *name)
 {
     // hasDirectory() means we have enough absolute directory
     // information at the beginning to bypass performing path searches.
-    return name[0] == '~' || name[0] == '/' ||
-          (name[0] == '.' && name[1] == '/') ||
-          (name[0] == '.' && name[1] == '.' && name[2] == '/');
+    // Names starting with "./" or "../" are relative: like any other relative
+    // name, they are searched for in every directory of the search order, so
+    // that "../name" is looked for in the parent of each of them.
+    return name[0] == '~' || name[0] == '/';
 }
 
 
@@ -480,50 +398,65 @@ bool SysFileSystem::searchPath(const char *name, const char *path, FileNameBuffe
         return checkCurrentFile(name, resolvedName);
     }
 
-    // get an end pointer
-    const char *pathEnd = path + strlen(path);
-
-    const char *p = path;
-    const char *q = strchr(p, ':');
-    // for each directory in searchpath
-    for (; p < pathEnd; p = q + 1, q = strchr(p, ':'))
+    // callers pass paths that came from getenv(), which returns NULL when the
+    // variable is not set
+    if (path == NULL)
     {
-        // it's possible we've hit the end, in which case, point the delimiter marker past the end of the
-        // string
-        if (q == NULL)
-        {
-            q = pathEnd;
-        }
-        size_t subLength = q - p;
-        if (subLength == 0)
-        {
-            // case "::" in path
-            continue;
-        }
+        resolvedName = "";
+        return false;
+    }
 
-        resolvedName.set(p, subLength);
-        if (!resolvedName.endsWith('/'))
-        {
-            resolvedName += '/';
-        }
-        resolvedName += name;
+    // For each directory in the search path.
+    //
+    // The scan advances only after the current entry has been dealt with. It
+    // used to advance and search in a single step, in the increment of a for
+    // loop, which meant that on the last entry it moved p past the delimiter
+    // and then called strchr() from there before the loop condition got a
+    // chance to stop it. On that entry the delimiter marker was the terminating
+    // NUL, so the search started one byte beyond the end of the string and read
+    // memory the string does not own.
+    //
+    // Most allocators let that pass unnoticed. OpenBSD's does not, and the test
+    // suite died there with a SIGSEGV inside strchr called from this function.
+    for (const char *p = path; *p != '\0'; )
+    {
+        const char *q = strchr(p, ':');
+        size_t subLength = (q == NULL) ? strlen(p) : (size_t)(q - p);
 
-        // take care of any special conditions in the name structure
-        // a failure here means an invalid name of some sort
-        if (canonicalizeName(resolvedName))
+        // skip empty entries, the "::" in a path case
+        if (subLength != 0)
         {
-            struct stat64 dummy;
-            if (stat64(resolvedName, &dummy) == 0)   /* If file is found,     */
+            resolvedName.set(p, subLength);
+            if (!resolvedName.endsWith('/'))
             {
-                // this needs to be a regular file
-                if (S_ISREG(dummy.st_mode))
+                resolvedName += '/';
+            }
+            resolvedName += name;
+
+            // take care of any special conditions in the name structure
+            // a failure here means an invalid name of some sort
+            if (canonicalizeName(resolvedName))
+            {
+                struct stat64 dummy;
+                if (stat64(resolvedName, &dummy) == 0)   /* If file is found,     */
                 {
-                    return true;
+                    // this needs to be a regular file
+                    if (S_ISREG(dummy.st_mode))
+                    {
+                        return true;
+                    }
+                    resolvedName = "";
+                    return false;
                 }
-                resolvedName = "";
-                return false;
             }
         }
+
+        // the last entry has no delimiter after it
+        if (q == NULL)
+        {
+            break;
+        }
+        p = q + 1;
     }
     resolvedName = "";
     return false;
@@ -551,7 +484,13 @@ bool SysFileSystem::resolveTilde(FileNameBuffer &name)
         // save everything after the first character
         tempName = ((const char *)name) + 1;
         // start with the home directory
-        name = getenv("HOME");
+        const char *home = getenv("HOME");
+        // without HOME the name cannot be resolved, as for an unknown user
+        if (home == NULL)
+        {
+            return false;
+        }
+        name = home;
         // We don't need to add a slash : If we have "~" alone, then no final slash expected (same as for "~user"). If "~/..." then we have the slash already
         name += (const char *)tempName;
     }
@@ -658,9 +597,9 @@ bool SysFileSystem::canonicalizeName(FileNameBuffer &name)
 
 
 /**
- * Normalize an absolute Unix path name.  Removes duplicate and trailing
- * slashes, resolves and removes ./ or ../  This works for any path name,
- * whether the resovled name exists or not.
+ * Normalize an absolute Unix path name.  Removes duplicate slashes, resolves
+ * and removes ./ or ../  A trailing slash is kept only if the name ended with
+ * one.  This works for any path name, whether the resovled name exists or not.
  *
  * @param name      The path name to normalize.
  * @param resolved  On success the normalized name is returned here.
@@ -750,8 +689,17 @@ bool SysFileSystem::normalizePathName(const char *name, FileNameBuffer &resolved
     // Terminate. Where, depends on several things.
     if (resolvedName.at(dest) == '/' && dest != 0)
     {
-        // overwrite a trailing slash
-        resolvedName.at(dest) = '\0';
+        // if the name ended with a slash, keep one: "file/" names a
+        // directory, and must not be taken for "file"
+        if (name[strlen(name) - 1] == '/')
+        {
+            resolvedName.at(++dest) = '\0';
+        }
+        else
+        {
+            // overwrite a trailing slash
+            resolvedName.at(dest) = '\0';
+        }
     }
     else
     {
@@ -1550,12 +1498,15 @@ This new filename must be freed when no longer needed.
 */
 char* temporaryFilename(const char *filename, int &errInfo)
 {
+    // the callers test errInfo, not the result
+    errInfo = 0;
     // allocate a buffer large enough to hold the file name plus the extra characters
     // we add to the end.
     size_t fullLength = strlen(filename) + 8;
     char *tempFileName = (char *)malloc(fullLength);
     if (tempFileName == NULL)
     {
+        errInfo = ENOMEM;
         return NULL;
     }
 
@@ -1563,14 +1514,13 @@ char* temporaryFilename(const char *filename, int &errInfo)
     srand((int)time(NULL));
     size_t num = rand();
     // we only handle the lower six digits
-    num = num % 6;
+    num = num % 1000000;
     size_t start = num;
 
     while (true)
     {
-        char numstr[8];
         // append 6 random digits to the base file name
-        snprintf(tempFileName, sizeof(numstr), "%s%06zu", filename, num);
+        snprintf(tempFileName, fullLength, "%s%06zu", filename, num);
 
         // if there's no matching file, we're finished.
         if (!SysFileSystem::fileExists(tempFileName))
@@ -1579,11 +1529,13 @@ char* temporaryFilename(const char *filename, int &errInfo)
         }
 
         // generate a new number for filling in the name
-        num = (num + 1) % 6;
+        num = (num + 1) % 1000000;
 
         // if we've wrapped around to where we started, time to give up
         if (num == start)
         {
+            free(tempFileName);
+            errInfo = EEXIST;
             return NULL;
         }
     }
@@ -2017,8 +1969,12 @@ void SysFileIterator::findNextEntry()
     while (fnmatch(patternSpec, testName, flags) != 0)
     {
 #ifndef HAVE_FNM_CASEFOLD
-        // free the uppercase copy of the last test
-        free((void *)testName);
+        // free the uppercase copy of the last test (only a caseless
+        // search made one; otherwise testName is the readdir() entry)
+        if (caseLess)
+        {
+            free((void *)testName);
+        }
 #endif
         entry = readdir(handle);
         if (entry == NULL)
@@ -2030,14 +1986,20 @@ void SysFileIterator::findNextEntry()
         }
         testName = entry->d_name;
 #ifndef HAVE_FNM_CASEFOLD
-        char *upperName = strdup(testName);
-        Utilities::strupper(upperName);
-        testName = upperName;
+        if (caseLess)
+        {
+            char *upperName = strdup(testName);
+            Utilities::strupper(upperName);
+            testName = upperName;
+        }
 #endif
     }
 #ifndef HAVE_FNM_CASEFOLD
     // free the uppercase copy of the last test
-    free((void *)testName);
+    if (caseLess)
+    {
+        free((void *)testName);
+    }
 #endif
     // we need to perform the stat64() using the fully resolved name.
     // if there is an allocation error here, we have limited ability to raise

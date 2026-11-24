@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2021 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -59,10 +59,40 @@
 #include <stdio.h>
 
 
-// global resource lock
-SysMutex Interpreter::resourceLock;
-// activity dispatch queue lock
-SysMutex Interpreter::dispatchLock;
+/**
+ * The global resource lock.
+ *
+ * This is deliberately a function-local static rather than a namespace-scope
+ * object.  createLocks() is reached from _rexx_init(), which is an ELF
+ * constructor, and the order of that constructor relative to the dynamic
+ * initializers of other translation units is fixed only by link order.  With a
+ * namespace-scope object this file's initializers ran *after* _rexx_init(), so
+ * the SysMutex default constructor set created back to false immediately after
+ * create() had set it to true.  request() then returned false for the rest of
+ * the process and every ResourceSection silently guarded nothing.
+ *
+ * A function-local static is initialized on first use, so the order cannot
+ * invert.  The first use is on the startup thread, before any activity exists.
+ *
+ * See bug #2078.
+ */
+SysMutex &Interpreter::resourceLock()
+{
+    static SysMutex theLock;
+    return theLock;
+}
+
+
+/**
+ * The startup lock, which serializes the one-time bootstrap in
+ * startInterpreter().  A function-local static for the same reason as the
+ * resource lock (bug #2078).  See bug #2079.
+ */
+SysMutex &Interpreter::startupLock()
+{
+    static SysMutex theLock;
+    return theLock;
+}
 
 QueueClass *Interpreter::interpreterInstances = OREF_NULL;
 
@@ -70,7 +100,11 @@ QueueClass *Interpreter::interpreterInstances = OREF_NULL;
 RexxObject *Interpreter::localServer = OREF_NULL;
 
 // the interpreter active state flag
-bool Interpreter::active = false;
+std::atomic<bool> Interpreter::active(false);
+
+// the interpreter languageLevel as a string
+char *Interpreter::languageLevel=NULL;  // set by getLanguageLevelString(), originally in Version.cpp
+
 
 // exit return codes.
 const int RC_OK         = 0;
@@ -82,6 +116,23 @@ const int RC_LOGIC_ERROR  = 2;
 void Interpreter::init()
 {
     interpreterInstances = new_queue();
+}
+
+
+/** Create and return a const char* version string (to replace the static definition in Version.cpp).
+ * @return a const char* version string
+*/
+const char *Interpreter::getLanguageLevelString()
+{
+    if (languageLevel==NULL)
+    {
+        languageLevel = new char[8];
+        snprintf(languageLevel, 8, "%d.%02d",
+          (REXX_CURRENT_LANGUAGE_LEVEL & 0x0000FF00) >> 8,
+           REXX_CURRENT_LANGUAGE_LEVEL & 0x000000FF
+          );
+    }
+    return (const char*) languageLevel;
 }
 
 
@@ -144,7 +195,10 @@ void Interpreter::processShutdown()
  */
 void Interpreter::startInterpreter(InterpreterStartupMode mode, const char *imageTarget)
 {
-    ResourceSection lock;
+    // The bootstrap is serialized by the startup lock, not by the resource lock:
+    // creating the local server below needs the kernel lock, and the kernel lock
+    // must never be requested while holding the resource lock.  See bug #2079.
+    StartupSection startup;
 
     // has everything been shutdown?
     if (!isActive())
@@ -155,7 +209,10 @@ void Interpreter::startInterpreter(InterpreterStartupMode mode, const char *imag
         memoryObject.initialize(mode == RUN_MODE, imageTarget);
         RexxCreateSessionQueue();
         // create our instances list
-        interpreterInstances = new_queue();
+        {
+            ResourceSection lock;
+            interpreterInstances = new_queue();
+        }
         // if we have a local server created already, don't recurse.
         if (localServer == OREF_NULL)
         {
@@ -179,7 +236,7 @@ void Interpreter::startInterpreter(InterpreterStartupMode mode, const char *imag
         }
     }
     // we're live now
-    active = true;
+    active.store(true, std::memory_order_release);
 }
 
 
@@ -324,11 +381,15 @@ InterpreterInstance *Interpreter::createInterpreterInstance(RexxOption *options)
     // We need to ensure that the interpreter is initialized before we create an
     // interpreter instance.  There are some nasty recursion problems that can result,
     // so this needs to be done carefully and the initialization needs to be protected by
-    // the resource lock during the entire process.
+    // the startup lock during the entire process.  Once the interpreter is active this
+    // is skipped without taking the lock, so the startup lock is never requested by a
+    // thread that holds the kernel lock (bug #2079).
+    if (!isActive())
     {
-        ResourceSection lock;
+        StartupSection startup;
         // if our instances list has not been created yet, then the memory subsystem has not
-        // been created yet.  Keep the lock during the entire process.
+        // been created yet.  Keep the lock during the entire process.  (During the bootstrap
+        // the list already exists, and this thread already holds the startup lock.)
         if (interpreterInstances == OREF_NULL)
         {
             startInterpreter(RUN_MODE, NULL);
@@ -400,8 +461,12 @@ bool Interpreter::haltAllActivities(RexxString *name)
     for (size_t listIndex = 1; listIndex <= interpreterInstances->items(); listIndex++)
     {
         InterpreterInstance *instance = (InterpreterInstance *)interpreterInstances->get(listIndex);
-        // halt every thing
-        result = result && instance->haltAllActivities(name);
+        // halt every thing: every instance, even after one that could not
+        // take it (result && ... would skip the rest)
+        if (!instance->haltAllActivities(name))
+        {
+            result = false;
+        }
     }
     return result;
 }
@@ -502,10 +567,34 @@ InstanceBlock::~InstanceBlock()
 void Interpreter::decodeConditionData(DirectoryClass *conditionObj, RexxCondition *condData)
 {
     memset(condData, 0, sizeof(RexxCondition));
-    condData->code = messageNumber((RexxString *)conditionObj->get(GlobalNames::CODE));
-    // just return the major part
-    condData->rc = messageNumber((RexxString *)conditionObj->get(GlobalNames::RC))/1000;
-    condData->conditionName = (RexxStringObject)conditionObj->get(GlobalNames::CONDITION);
+    RexxString *conditionName = (RexxString *)conditionObj->get(GlobalNames::CONDITION);
+    condData->conditionName = (RexxStringObject)conditionName;
+
+    RexxObject *code = (RexxObject *)conditionObj->get(GlobalNames::CODE);
+    RexxObject *rc = (RexxObject *)conditionObj->get(GlobalNames::RC);
+    // only a SYNTAX condition has an error code, and its RC is the error number
+    if (conditionName != OREF_NULL && conditionName->strCompare(GlobalNames::SYNTAX))
+    {
+        if (code != OREF_NULL)
+        {
+            condData->code = messageNumber((RexxString *)code);
+        }
+        if (rc != OREF_NULL)
+        {
+            // just return the major part
+            condData->rc = messageNumber((RexxString *)rc)/1000;
+        }
+    }
+    // ERROR and FAILURE have the return code of a command, which can be any
+    // value; anything that is not a whole number leaves rc as 0
+    else if (rc != OREF_NULL)
+    {
+        wholenumber_t number;
+        if (rc->numberValue(number))
+        {
+            condData->rc = number;
+        }
+    }
 
     RexxObject *temp = (RexxObject *)conditionObj->get(GlobalNames::MESSAGE);
     if (temp != OREF_NULL)
@@ -519,8 +608,12 @@ void Interpreter::decodeConditionData(DirectoryClass *conditionObj, RexxConditio
         condData->errortext = (RexxStringObject)temp;
     }
 
+    // RAISE allows any object as the DESCRIPTION, and as the ADDITIONAL
+    // information of a condition other than SYNTAX: give them only when they
+    // are of the type the structure declares (the condition object has them
+    // as they are)
     temp = (RexxObject *)conditionObj->get(GlobalNames::DESCRIPTION);
-    if (temp != OREF_NULL)
+    if (temp != OREF_NULL && isString(temp))
     {
         condData->description = (RexxStringObject)temp;
     }
@@ -544,7 +637,7 @@ void Interpreter::decodeConditionData(DirectoryClass *conditionObj, RexxConditio
     }
 
     temp = (RexxObject *)conditionObj->get(GlobalNames::ADDITIONAL);
-    if (temp != OREF_NULL)
+    if (temp != OREF_NULL && isArray(temp))
     {
         condData->additional = (RexxArrayObject)temp;
     }
@@ -618,6 +711,8 @@ RexxString *Interpreter::getCurrentQueue()
 void Interpreter::logicError (const char *desc)
 {
     printf("Logic error: %s\n",desc);
+    // the process ends right below: make sure the message is not left in a buffer
+    fflush(stdout);
 
     // allow debugging
 #ifdef WIN32
@@ -634,10 +729,12 @@ void Interpreter::logicError (const char *desc)
  * Parse out the error code string into the messagecode value
  *
  * @param errorcode The string version of the error code.
+ * @param isThrow   true if the code was given to THROW (or to the Throw()
+ *                  API), so that an error names THROW instead of RAISE.
  *
  * @return The composite error code number.
  */
-wholenumber_t Interpreter::messageNumber(RexxString *errorcode)
+wholenumber_t Interpreter::messageNumber(RexxString *errorcode, bool isThrow)
 {
     wholenumber_t  primary = 0;          /* Primary part of error code, major */
     wholenumber_t  secondary = 0;        /* Secondary protion (minor code)    */
@@ -652,7 +749,7 @@ wholenumber_t Interpreter::messageNumber(RexxString *errorcode)
     // must be a whole number in the correct range
     if (!new_string(errorcode->getStringData(), count)->numberValue(primary) || primary < 1 || primary >= 100)
     {
-        reportException(Error_Expression_result_raise);
+        reportException(isThrow ? Error_Expression_result_throw : Error_Expression_result_raise);
 
     }
 
@@ -664,10 +761,38 @@ wholenumber_t Interpreter::messageNumber(RexxString *errorcode)
     {
         if (!new_string(decimalPoint + 1, errorcode->getLength() - count -1)->numberValue(secondary) || secondary < 0  || secondary >= 1000)
         {
-            reportException(Error_Expression_result_raise);
+            reportException(isThrow ? Error_Expression_result_throw : Error_Expression_result_raise);
         }
     }
     return primary + secondary;          // add two portions together, return
+}
+
+
+/**
+ * Convert the RC of a SYNTAX condition given to RAISE or THROW (or to
+ * the Throw() API) to an error number, and check that the error exists.
+ *
+ * @param rc      The RC value.
+ * @param isThrow true for THROW and Throw(), so that the errors name THROW.
+ *
+ * @return The composite error code number.
+ */
+wholenumber_t Interpreter::syntaxErrorNumber(RexxObject *rc, bool isThrow)
+{
+    // the string value of the RC (requestString() always gives a string)
+    RexxString *errorcode = rc->requestString();
+
+    wholenumber_t number = messageNumber(errorcode, isThrow);
+    wholenumber_t primary = (number / 1000) * 1000;
+    // both the primary and the secondary message must exist
+    if (getMessageText(primary) == OREF_NULL || (number != primary && getMessageText(number) == OREF_NULL))
+    {
+        // shown in the "nn.nnn" form of a CODE (93.9), not as 93009
+        char work[32];
+        snprintf(work, sizeof(work), "%d.%d", (int)(number / 1000), (int)(number % 1000));
+        reportException(isThrow ? Error_Execution_error_condition_throw : Error_Execution_error_condition, new_string(work));
+    }
+    return number;
 }
 
 

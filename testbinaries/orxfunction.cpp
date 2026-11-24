@@ -1,6 +1,6 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
-/* Copyright (c) 2008-2022 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2008-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -513,6 +513,50 @@ RexxRoutine1(RexxStemObject,
     return value;
 }
 
+// use the services on the caller's variables and report what each one saw, as
+// an array: the value of the caller's variable named by the argument (.nil if
+// none), its value after setting it to "set" (.nil if none), the value after
+// dropping it (.nil if none), the number of variables GetAllContextVariables()
+// returns, whether ResolveStemVariable() of "STEM." found a stem, whether
+// GetContextVariableReference() gave a reference, and the return code of a
+// RexxVariablePool() symbolic fetch of the variable
+RexxRoutine1(RexxObjectPtr,
+            TestCallerVariables,
+            CSTRING, name)
+{
+    RexxArrayObject report = context->NewArray(7);
+    RexxObjectPtr value = context->GetContextVariable(name);
+    context->ArrayPut(report, value != NULLOBJECT ? value : context->Nil(), 1);
+    context->SetContextVariable(name, context->String("set"));
+    value = context->GetContextVariable(name);
+    context->ArrayPut(report, value != NULLOBJECT ? value : context->Nil(), 2);
+    context->DropContextVariable(name);
+    value = context->GetContextVariable(name);
+    context->ArrayPut(report, value != NULLOBJECT ? value : context->Nil(), 3);
+    RexxDirectoryObject all = context->GetAllContextVariables();
+    context->ArrayPut(report, all != NULLOBJECT ? context->SendMessage0(all, "ITEMS") : context->Nil(), 4);
+    context->ArrayPut(report, context->Logical(context->ResolveStemVariable(context->String("STEM.")) != NULLOBJECT), 5);
+    context->ArrayPut(report, context->Logical(context->GetContextVariableReference(name) != NULLOBJECT), 6);
+
+    SHVBLOCK block;
+    block.shvnext = NULL;
+    block.shvname.strptr = name;
+    block.shvname.strlength = strlen(name);
+    block.shvnamelen = block.shvname.strlength;
+    block.shvvalue.strptr = NULL;
+    block.shvvalue.strlength = 0;
+    block.shvvaluelen = 0;
+    block.shvcode = RXSHV_SYFET;
+    block.shvret = 0;
+    RexxReturnCode rc = RexxVariablePool(&block);
+    if (block.shvvalue.strptr != NULL)
+    {
+        RexxFreeMemory(block.shvvalue.strptr);
+    }
+    context->ArrayPut(report, context->WholeNumber(rc), 7);
+    return report;
+}
+
 RexxRoutine1(RexxClassObject,
             TestFindContextClass,
             CSTRING, name)
@@ -557,6 +601,77 @@ RexxObjectPtr RexxEntry rHandler(RexxExitContext *context,
     rc = rc * 10 + ioContext->AreOutputAndErrorSameTarget();
 
     return context->WholeNumberToObject(rc);
+}
+
+
+// test DIRECT command handler for TestAddCommandEnvironment "condition"
+// raises the condition named by the command (e.g. "USER FOO") with RC 7 and
+// an additional array with one item, "additional"; the command "NORESULT"
+// raises nothing and answers no result
+RexxObjectPtr RexxEntry cHandler(RexxExitContext *context,
+                                 RexxStringObject address,
+                                 RexxStringObject command)
+{
+    if (strcmp(context->CString(command), "NORESULT") == 0)
+    {
+        return NULLOBJECT;
+    }
+    context->RaiseCondition(context->CString(command), command, context->ArrayOfOne(context->String("additional")), context->WholeNumberToObject(7));
+    return context->WholeNumberToObject(7);
+}
+
+
+// test DIRECT command handler for TestAddCommandEnvironment "throw" (RFE #31):
+// throws the condition named by the command (e.g. "USER FOO") with the
+// description "thrown"; "ERROR" and "FAILURE" are thrown with RC 7
+RexxObjectPtr RexxEntry tHandler(RexxExitContext *context,
+                                 RexxStringObject address,
+                                 RexxStringObject command)
+{
+    CSTRING name = context->CString(command);
+    RexxObjectPtr rc = NULLOBJECT;
+    if (strcmp(name, "ERROR") == 0 || strcmp(name, "FAILURE") == 0)
+    {
+        rc = context->WholeNumberToObject(7);
+    }
+    context->Throw(name, rc, context->String("thrown"), NULLOBJECT);
+    return context->WholeNumberToObject(7);
+}
+
+
+// the same, as a REDIRECTING command handler
+RexxObjectPtr RexxEntry tRHandler(RexxExitContext *context,
+                                  RexxStringObject address,
+                                  RexxStringObject command,
+                                  RexxIORedirectorContext *ioContext)
+{
+    return tHandler(context, address, command);
+}
+
+
+// the exit context of the "nested" command handler while it runs (bug #2104)
+static RexxExitContext *nestedExitContext = NULL;
+
+// test DIRECT command handler for TestAddCommandEnvironment "nested" (bug
+// #2104): sends RUN to the .local entry named by the command; while RUN runs,
+// native code uses this handler's exit context (TestNestedSetCallerVariable).
+// Answers the code of the SYNTAX error that SendMessage0 trapped, else 0
+RexxObjectPtr RexxEntry nHandler(RexxExitContext *context,
+                                 RexxStringObject address,
+                                 RexxStringObject command)
+{
+    nestedExitContext = context;
+    RexxObjectPtr target = context->DirectoryAt(context->GetLocalEnvironment(), context->CString(command));
+    context->SendMessage0(target, "RUN");
+    nestedExitContext = NULL;
+    if (context->CheckCondition())
+    {
+        RexxCondition info;
+        context->DecodeConditionInfo(context->GetConditionInfo(), &info);
+        context->ClearCondition();
+        return context->WholeNumberToObject(info.code);
+    }
+    return context->WholeNumberToObject(0);
 }
 
 
@@ -746,7 +861,8 @@ RexxObjectPtr RexxEntry ioHandler(RexxExitContext *context, RexxStringObject add
 }
 
 
-// install 'ioHandler', 'rHandler', or 'dHandler'
+// install 'ioHandler', 'rHandler', 'cHandler', 'tHandler', 'tRHandler', 'nHandler',
+// or 'dHandler'
 RexxRoutine2(RexxObjectPtr,
              TestAddCommandEnvironment,
              CSTRING, name,
@@ -763,11 +879,65 @@ RexxRoutine2(RexxObjectPtr,
             context->AddCommandEnvironment(name, (REXXPFN)rHandler, REDIRECTING_COMMAND_ENVIRONMENT);
         }
     }
+    else if (type[0] == 'c' || type[0] == 'C')
+    {   // direct command handler that raises the condition named by the command
+        context->AddCommandEnvironment(name, (REXXPFN)cHandler, DIRECT_COMMAND_ENVIRONMENT);
+    }
+    else if (type[0] == 't' || type[0] == 'T')
+    {   // command handler that throws the condition named by the command:
+        // "throw" (direct) or "throw-redirecting"
+        if (strcmp(type + 1, "hrow-redirecting") == 0)
+        {
+            context->AddCommandEnvironment(name, (REXXPFN)tRHandler, REDIRECTING_COMMAND_ENVIRONMENT);
+        }
+        else
+        {
+            context->AddCommandEnvironment(name, (REXXPFN)tHandler, DIRECT_COMMAND_ENVIRONMENT);
+        }
+    }
+    else if (type[0] == 'n' || type[0] == 'N')
+    {   // direct command handler whose exit context is used again while it runs
+        context->AddCommandEnvironment(name, (REXXPFN)nHandler, DIRECT_COMMAND_ENVIRONMENT);
+    }
     else
     {   // direct command handler
         context->AddCommandEnvironment(name, (REXXPFN)dHandler, DIRECT_COMMAND_ENVIRONMENT);
     }
     return NULLOBJECT;
+}
+
+// sets the variable named by the argument to "set" in the issuer of the
+// command that the "nested" handler is running, through the handler's exit
+// context; returns 0 if no such command is running (bug #2104)
+RexxRoutine1(int,
+             TestNestedSetCallerVariable,
+             CSTRING, name)
+{
+    if (nestedExitContext == NULL)
+    {
+        return 0;
+    }
+    nestedExitContext->SetContextVariable(name, context->String("set"));
+    return 1;
+}
+
+// as TestAddCommandEnvironment, with StackCommandEnvironment ('cHandler' or
+// 'dHandler'); returns what StackCommandEnvironment returns.  The type "bad"
+// passes an environment type that is neither direct nor redirecting.
+RexxRoutine2(logical_t,
+             TestStackCommandEnvironment,
+             CSTRING, name,
+             CSTRING, type)
+{
+    if (strcmp(type, "bad") == 0)
+    {
+        return context->StackCommandEnvironment(name, (REXXPFN)dHandler, 0);
+    }
+    if (type[0] == 'c' || type[0] == 'C')
+    {
+        return context->StackCommandEnvironment(name, (REXXPFN)cHandler, DIRECT_COMMAND_ENVIRONMENT);
+    }
+    return context->StackCommandEnvironment(name, (REXXPFN)dHandler, DIRECT_COMMAND_ENVIRONMENT);
 }
 
 RexxRoutine1(int,
@@ -865,7 +1035,23 @@ RexxRoutine4(int,
             OPTIONAL_RexxArrayObject, add,
             OPTIONAL_RexxObjectPtr, result)
 {
-    context->ThrowCondition(name, (RexxStringObject)desc, add, result);
+    // desc is a C string: it must be passed as a String object
+    context->ThrowCondition(name, desc == NULL ? NULLOBJECT : context->String(desc), add, result);
+    // this should never execute
+    context->SetContextVariable("CONTINUE", context->True());
+    return 0;
+}
+
+// Throw() (RFE #31): as the THROW instruction.  The arguments are passed as
+// they come, so that the tests can check how Throw() rejects bad ones
+RexxRoutine4(int,
+            TestThrow,
+            OPTIONAL_CSTRING, name,
+            OPTIONAL_RexxObjectPtr, rc,
+            OPTIONAL_RexxObjectPtr, desc,
+            OPTIONAL_RexxObjectPtr, add)
+{
+    context->Throw(name, rc, (RexxStringObject)desc, add);
     // this should never execute
     context->SetContextVariable("CONTINUE", context->True());
     return 0;
@@ -884,6 +1070,14 @@ RexxRoutine1(RexxObjectPtr,
     attachedContext->DetachThread();
     context->RaiseException0(Rexx_Error_Execution_no_concurrency);
     return r;
+}
+
+
+RexxRoutine0(int, TestHaltThread)
+{
+    // asks for a halt of the Rexx code that called this routine (bug #2124)
+    context->threadContext->HaltThread();
+    return 0;
 }
 
 
@@ -945,8 +1139,11 @@ RexxRoutineEntry orxtest_funcs[] = {
     REXX_TYPED_ROUTINE(TestGetContextForm,    TestGetContextForm),
     REXX_TYPED_ROUTINE(TestGetContextDigits,  TestGetContextDigits),
     REXX_TYPED_ROUTINE(TestResolveStemVariable, TestResolveStemVariable),
+    REXX_TYPED_ROUTINE(TestCallerVariables,     TestCallerVariables),
     REXX_TYPED_ROUTINE(TestFindContextClass,  TestFindContextClass),
     REXX_TYPED_ROUTINE(TestAddCommandEnvironment, TestAddCommandEnvironment),
+    REXX_TYPED_ROUTINE(TestNestedSetCallerVariable, TestNestedSetCallerVariable),
+    REXX_TYPED_ROUTINE(TestStackCommandEnvironment, TestStackCommandEnvironment),
     REXX_TYPED_ROUTINE(TestRaiseException0,         TestRaiseException0),
     REXX_TYPED_ROUTINE(TestRaiseException1,         TestRaiseException1),
     REXX_TYPED_ROUTINE(TestRaiseException2,         TestRaiseException2),
@@ -956,7 +1153,9 @@ RexxRoutineEntry orxtest_funcs[] = {
     REXX_TYPED_ROUTINE(TestThrowException2,         TestThrowException2),
     REXX_TYPED_ROUTINE(TestThrowException,          TestThrowException),
     REXX_TYPED_ROUTINE(TestThrowCondition,          TestThrowCondition),
+    REXX_TYPED_ROUTINE(TestThrow,                   TestThrow),
     REXX_TYPED_ROUTINE(TestNestedAttach,            TestNestedAttach),
+    REXX_TYPED_ROUTINE(TestHaltThread,              TestHaltThread),
     REXX_LAST_ROUTINE()
 };
 

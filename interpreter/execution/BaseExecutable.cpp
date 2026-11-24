@@ -253,7 +253,7 @@ void BaseExecutable::processNewExecutableArgs(RexxObject **&init_args, size_t &a
         // using the calling source context, so get the package from the top activation if
         // there is one.
         // see if we have an active context and use the current source as the basis for the lookup
-        RexxActivation *currentContext = ActivityManager::currentActivity->getCurrentRexxFrame();
+        RexxActivation *currentContext = ActivityManager::currentActivity.load()->getCurrentRexxFrame();
         if (currentContext != OREF_NULL)
         {
             sourceContext = currentContext->getPackage();
@@ -273,7 +273,9 @@ void BaseExecutable::processNewExecutableArgs(RexxObject **&init_args, size_t &a
 
         if (isOfClass(Method, option) || isOfClass(Routine, option))
         {
-            sourceContext = ((BaseExecutable *)option)->getPackage();
+            // a native method has no package (getPackageObject() is OREF_NULL):
+            // then there is nothing to inherit, as with no context at all
+            sourceContext = ((BaseExecutable *)option)->getPackageObject();
         }
         else if (isOfClass(Package, option))
         {
@@ -296,7 +298,7 @@ void BaseExecutable::processNewExecutableArgs(RexxObject **&init_args, size_t &a
             // using the calling source context, so get the package from the top activation if
             // there is one.
             // see if we have an active context and use the current source as the basis for the lookup
-            RexxActivation *currentContext = ActivityManager::currentActivity->getCurrentRexxFrame();
+            RexxActivation *currentContext = ActivityManager::currentActivity.load()->getCurrentRexxFrame();
             if (currentContext != OREF_NULL)
             {
                 sourceContext = currentContext->getPackage();
@@ -328,7 +330,7 @@ void BaseExecutable::processNewFileExecutableArgs(RexxString *&filename,
         // using the calling source context, so get the package from the top activation if
         // there is one.
         // see if we have an active context and use the current source as the basis for the lookup
-        RexxActivation *currentContext = ActivityManager::currentActivity->getCurrentRexxFrame();
+        RexxActivation *currentContext = ActivityManager::currentActivity.load()->getCurrentRexxFrame();
         if (currentContext != OREF_NULL)
         {
             sourceContext = currentContext->getPackage();
@@ -342,7 +344,9 @@ void BaseExecutable::processNewFileExecutableArgs(RexxString *&filename,
 
     if (isOfClass(Method, sourceContext) || isOfClass(Routine, sourceContext))
     {
-        sourceContext = ((BaseExecutable *)sourceContext)->getPackage();
+        // a native method has no package (getPackageObject() is OREF_NULL):
+        // then there is nothing to inherit, as with no context at all
+        sourceContext = ((BaseExecutable *)sourceContext)->getPackageObject();
     }
     else
     {
@@ -361,7 +365,7 @@ void BaseExecutable::processNewFileExecutableArgs(RexxString *&filename,
         // using the calling source context, so get the package from the top activation if
         // there is one.
         // see if we have an active context and use the current source as the basis for the lookup
-        RexxActivation *currentContext = ActivityManager::currentActivity->getCurrentRexxFrame();
+        RexxActivation *currentContext = ActivityManager::currentActivity.load()->getCurrentRexxFrame();
         if (currentContext != OREF_NULL)
         {
             sourceContext = currentContext->getPackage();

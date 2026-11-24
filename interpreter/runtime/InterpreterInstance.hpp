@@ -1,6 +1,6 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -43,6 +43,7 @@
 #ifndef Included_InterpreterInstance_hpp
 #define Included_InterpreterInstance_hpp
 
+#include "ActivityList.hpp"
 #include "RexxCore.h"
 #include "ExitHandler.hpp"
 #include "ActivationApiContexts.hpp"
@@ -79,6 +80,9 @@ public:
 
     RexxString *getDefaultEnvironment() { return defaultEnvironment; }
     Activity *getRootActivity() { return rootActivity; }
+    // true when no activity other than the root one is left; the root activity
+    // is no longer on the list if its thread detached. Needs the resource lock.
+    inline bool onlyRootLeft() { return allActivities.items() == (rootDetached ? 0 : 1); }
     uint32_t getIdntfr();
 
     InterpreterInstance(ExitHandler *handlers);
@@ -88,8 +92,8 @@ public:
     bool terminate();
     void waitForCompletion();
     void attachToProcess();
-    Activity *enterOnCurrentThread();
-    Activity *attachThread();
+    Activity *enterOnCurrentThread(bool &activityCreated);
+    Activity *attachThread(bool &activityCreated);
     int attachThread(RexxThreadContext *&attachedContext);
     bool detachThread();
     bool detachThread(Activity *activity);
@@ -119,7 +123,12 @@ public:
     inline DirectoryClass *getLocal() { return localEnvironment; }
     void addCommandHandler(const char *name, const char *registeredName);
     void addCommandHandler(const char *name, REXXPFN entryPoint, HandlerType::Enum type);
+    void stackCommandHandler(const char *name, REXXPFN entryPoint, HandlerType::Enum type);
     CommandHandler *resolveCommandHandler(RexxString *name);
+    RexxObject *addCommandHandler(RexxString *name, RexxObject *handler);
+    RexxObject *removeCommandHandler(RexxString *name);
+    StringTable *listCommandHandlers();
+    ArrayClass *listCommandHandlerStack(RexxString *name);
     PackageClass *getRequiresFile(Activity *activity, RexxString *name);
     PackageClass *loadRequires(Activity *activity, RexxString *shortName, ArrayClass *source);
     PackageClass *loadRequires(Activity *activity, RexxString *shortName, RexxString *fullName);
@@ -140,7 +149,17 @@ protected:
 
     Activity            *rootActivity;       // the initial activity
     SecurityManager     *securityManager;    // the security manager for our instance
-    QueueClass          *allActivities;      // all activities associated with this instance
+    // NOT a Rexx object: see ActivityList.hpp. The paths that maintain this
+    // cannot all hold kernel access, so it must not be walked by the collector.
+    // Every touch of this list needs the resource lock, with no
+    // exceptions. Kernel access is NOT a substitute: it excludes the collector,
+    // but not a thread holding only the resource lock, and Interpreter::
+    // haltAllActivities() and traceAllActivities() are exactly that -- reachable
+    // from a signal handler and from the RexxHaltInstance API on any thread.
+    // Unlike the QueueClass this replaced, whose backing store was a Rexx object
+    // and so stayed live for a stale reader, a vector reallocation hands the old
+    // buffer straight back to operator delete.
+    ActivityList         allActivities;      // all activities associated with this instance
     RexxString          *defaultEnvironment; // the default address environment
     RexxString          *searchPath;         // additional Rexx search path
     ArrayClass          *searchExtensions;   // extensions to search on for external calls
@@ -152,6 +171,7 @@ protected:
 
     bool terminating;                        // shutdown indicator
     bool terminated;                         // last thread cleared indicator
+    bool rootDetached;                       // the creating thread called DetachThread()
     SysSemaphore terminationSem;             // used to signal that everything has shutdown
 
     // array of system exits

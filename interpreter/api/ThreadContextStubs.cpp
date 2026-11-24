@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2022 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -265,7 +265,8 @@ RexxDirectoryObject RexxEntry GetGlobalEnvironment(RexxThreadContext *c)
 
 logical_t RexxEntry IsInstanceOf(RexxThreadContext *c, RexxObjectPtr o, RexxClassObject cl)
 {
-    ApiContext context(c, false);      // this can safely be a non-blocking call.
+    // not a non-blocking call: a number may allocate its string value here
+    ApiContext context(c);
     try
     {
         return ((RexxObject *)o)->isInstanceOf((RexxClass *)cl);
@@ -555,7 +556,8 @@ RexxRoutineObject RexxEntry NewRoutine(RexxThreadContext *c, CSTRING n, CSTRING 
 
 logical_t RexxEntry IsRoutine(RexxThreadContext * c, RexxObjectPtr o)
 {
-    ApiContext context(c, false);       // this can be safely executed without blocking
+    // not a non-blocking call: a number may allocate its string value here
+    ApiContext context(c);
     try
     {
         // convert the name to a string instance, and check the environments.
@@ -570,7 +572,8 @@ logical_t RexxEntry IsRoutine(RexxThreadContext * c, RexxObjectPtr o)
 
 logical_t RexxEntry IsMethod(RexxThreadContext * c, RexxObjectPtr o)
 {
-    ApiContext context(c, false);       // this can be safely executed without blocking
+    // not a non-blocking call: a number may allocate its string value here
+    ApiContext context(c);
     try
     {
         // convert the name to a string instance, and check the environments.
@@ -1914,8 +1917,56 @@ void RexxEntry RaiseCondition(RexxThreadContext *c, CSTRING n, RexxStringObject 
     try
     {
         Protected<RexxString> name = new_upper_string(n);
+        // a SYNTAX condition needs an error number: RaiseException or
+        // RaiseConditionObject raise one
+        if (name->strCompare(GlobalNames::SYNTAX))
+        {
+            reportException(Error_Incorrect_method_user_defined, new_string("RaiseCondition cannot raise a SYNTAX condition; use RaiseException or RaiseConditionObject"));
+        }
         context.context->enableConditionTrap();
         context.activity->raiseCondition(name, OREF_NULL, (RexxString *)desc, (RexxObject *)add, (RexxObject *)result);
+    }
+    catch (NativeActivation *)
+    {
+    }
+}
+
+void RexxEntry RaiseConditionObject(RexxThreadContext *c, RexxDirectoryObject d)
+{
+    ApiContext context(c);
+    try
+    {
+        if (d == NULLOBJECT)
+        {
+            reportException(Error_Incorrect_method_null, 1);
+        }
+        if (!isOfClass(Directory, (RexxObject *)d))
+        {
+            reportException(Error_Incorrect_method_noclass, 1, new_string("Directory"));
+        }
+        context.context->enableConditionTrap();
+        context.activity->raiseConditionObject((DirectoryClass *)d, Activity::CONDITION_RAISE);
+    }
+    catch (NativeActivation *)
+    {
+    }
+}
+
+void RexxEntry ThrowObject(RexxThreadContext *c, RexxDirectoryObject d)
+{
+    ApiContext context(c);
+    try
+    {
+        if (d == NULLOBJECT)
+        {
+            reportException(Error_Incorrect_method_null, 1);
+        }
+        if (!isOfClass(Directory, (RexxObject *)d))
+        {
+            reportException(Error_Incorrect_method_noclass, 1, new_string("Directory"));
+        }
+        context.context->enableConditionTrap();
+        context.activity->raiseConditionObject((DirectoryClass *)d, Activity::CONDITION_THROW);
     }
     catch (NativeActivation *)
     {
@@ -2262,4 +2313,6 @@ RexxThreadInterface Activity::threadContextFunctions =
     IsStringTable,
     SendMessageScoped,
     GetInterpreterInstance,
+    RaiseConditionObject,
+    ThrowObject,
 };

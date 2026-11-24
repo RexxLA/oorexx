@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -90,6 +90,16 @@ const int  query_system_position = 0x10;
 #define RDWR_CREAT  (RX_O_RDWR | RX_O_CREAT)
 #define WR_CREAT    (RX_O_WRONLY | RX_O_CREAT)
 #define IREAD_IWRITE (RX_S_IREAD | RX_S_IWRITE)
+
+// do these open flags open the stream for writing?  The access modes are
+// values, not bits (POSIX compares them after masking with O_ACCMODE):
+// where O_RDWR is O_RDONLY | O_WRONLY, as under WASI, testing them as
+// single bits would take a READ open for a writeable one
+static inline bool isWriteable(int oflag)
+{
+    int accessMode = oflag & (RX_O_RDONLY | RX_O_WRONLY | RX_O_RDWR);
+    return accessMode == RX_O_WRONLY || accessMode == RX_O_RDWR;
+}
 
 /**
  * Helper routine for the method stubs to validate the
@@ -493,7 +503,7 @@ void StreamInfo::close()
     // and raise a NOTREADY condition if anything went amiss
     if (!closed)
     {
-        defaultResult = context->WholeNumberToObject(fileInfo.errorInfo());
+        defaultResult = context->WholeNumberToObject(HOST_ERRNO(fileInfo.errorInfo()));
         notreadyError();
     }
     // no longer open for business
@@ -610,6 +620,8 @@ const char *StreamInfo::handleOpen(const char *options)
 
     // reset the standard fields
     resetFields();
+    // resetFields() forgets that this is a handle stream: it still is
+    opened_as_handle = true;
 
     /* copy into the full name from the name */
     qualified_name = stream_name;
@@ -674,6 +686,14 @@ const char *StreamInfo::handleOpen(const char *options)
         {
             raiseException(Rexx_Error_Incorrect_method);
         }
+    }
+
+    // resetFields() has reset fileInfo, so attach it to the handle again
+    fileInfo.open(handle_value);
+    // don't buffer if we've explicitly requested no buffering.
+    if (nobuffer)
+    {
+        fileInfo.setBuffering(false, 0);
     }
 
 /********************************************************************************************/
@@ -832,7 +852,7 @@ void StreamInfo::implicitOpen(int type)
             if (defaultResult == NULLOBJECT)
             {
                 char work[30];
-                snprintf(work, sizeof(work), "ERROR:%d", fileInfo.errorInfo());
+                snprintf(work, sizeof(work), "ERROR:%d", HOST_ERRNO(fileInfo.errorInfo()));
                 defaultResult = context->NewStringFromAsciiz(work);
             }
             notreadyError();
@@ -2029,9 +2049,13 @@ int StreamInfo::lineout(RexxStringObject data, bool _setPosition, int64_t positi
         // if this is a binary stream, we may have a line to complete
         if (record_based)
         {
-            // calculate length to write out
-            size_t padding = binaryRecordLength - (charWritePosition - 1) % binaryRecordLength;
-            completeLine(padding);
+            // only a partially written record needs completing; at the
+            // start of a record there is nothing to pad
+            size_t written = (size_t)((charWritePosition - 1) % binaryRecordLength);
+            if (written > 0)
+            {
+                completeLine(binaryRecordLength - written);
+            }
         }
         // not a line repositioning?  we need to close
         if (!_setPosition)
@@ -2222,7 +2246,7 @@ const char *StreamInfo::streamFlush()
     if (!fileInfo.flush())
     {
         char         work[30];              /* error information buffer          */
-        snprintf(work, sizeof(work), "ERROR:%d", fileInfo.errorInfo());   /* format the error return           */
+        snprintf(work, sizeof(work), "ERROR:%d", HOST_ERRNO(fileInfo.errorInfo()));   /* format the error return           */
                                         /* go raise a notready condition     */
         notreadyError(fileInfo.errorInfo(), context->NewStringFromAsciiz(work));
     }
@@ -2415,7 +2439,7 @@ const char *StreamInfo::streamOpen(const char *options)
     // If read/write/both/append not specified, the default is BOTH, with the initial
     // positioning at the end
     // (According to the current doc.)
-    if (!(oflag & (RX_O_WRONLY | RDWR_CREAT )) && !read_only)
+    if (!isWriteable(oflag) && !read_only)
     {
         oflag |= RX_O_RDWR | RDWR_CREAT;    /* set this up for read/write mode   */
         pmode = IREAD_IWRITE;            /* save the pmode info               */
@@ -2433,7 +2457,7 @@ const char *StreamInfo::streamOpen(const char *options)
         if (!SysFileSystem::fileExists(qualified_name))
         {
             char work[32];
-            snprintf(work, sizeof(work), "ERROR:%d", ENOENT);
+            snprintf(work, sizeof(work), "ERROR:%d", HOST_ERRNO(ENOENT));
             // raise a notready condition
             notreadyError(ENOENT, context->NewStringFromAsciiz(work));
         }
@@ -2444,7 +2468,10 @@ const char *StreamInfo::streamOpen(const char *options)
     }
     /* if write only specified           */
     /*      - try both first             */
-    if (oflag & RX_O_WRONLY)
+    // the access modes are values, not bits (POSIX compares them after
+    // masking with O_ACCMODE): where O_RDWR is O_RDONLY | O_WRONLY, as
+    // under WASI, "oflag & RX_O_WRONLY" would be true for BOTH as well
+    if ((oflag & (RX_O_RDONLY | RX_O_WRONLY | RX_O_RDWR)) == RX_O_WRONLY)
     {
         /* set both flags                    */
         read_write = true;
@@ -2467,7 +2494,7 @@ const char *StreamInfo::streamOpen(const char *options)
             {
                 char work[32];
 
-                snprintf(work, sizeof(work), "ERROR:%d", fileInfo.errorInfo()); /* format the error return           */
+                snprintf(work, sizeof(work), "ERROR:%d", HOST_ERRNO(fileInfo.errorInfo())); /* format the error return           */
                 /* go raise a notready condition     */
                 notreadyError(fileInfo.errorInfo(), context->NewStringFromAsciiz(work));
             }
@@ -2477,7 +2504,7 @@ const char *StreamInfo::streamOpen(const char *options)
         else
         {
             char work[32];
-            snprintf(work, sizeof(work), "ERROR:%d", fileInfo.errorInfo()); /* format the error return           */
+            snprintf(work, sizeof(work), "ERROR:%d", HOST_ERRNO(fileInfo.errorInfo())); /* format the error return           */
             /* go raise a notready condition     */
             notreadyError(fileInfo.errorInfo(), context->NewStringFromAsciiz(work));
         }
@@ -2498,7 +2525,7 @@ const char *StreamInfo::streamOpen(const char *options)
 /*          so set it to one                                                                */
 /********************************************************************************************/
                                         /* persistent writeable stream?      */
-    if (!fileInfo.isTransient() && (oflag & (RX_O_WRONLY | RDWR_CREAT)))
+    if (!fileInfo.isTransient() && isWriteable(oflag))
     {
         if (size() > 0)
         {   /* existing stream?                  */
@@ -2565,8 +2592,9 @@ RexxMethod2(CSTRING, stream_open, CSELF, streamPtr, OPTIONAL_CSTRING, options)
  */
 void StreamInfo::setHandle(int fh)
 {
-    fileInfo.open(fh);
-    opened_as_handle = 1;
+    // the handle is attached to fileInfo when the stream is opened
+    handle_value = fh;
+    opened_as_handle = true;
 }
 
 /********************************************************************************************/
@@ -2596,9 +2624,20 @@ RexxMethod2(int, handle_set, CSELF, streamPtr, int, fh)
 /********************************************************************************************/
 RexxMethod1(int, std_set, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-    stream_info->setStandard();
-    return 0;
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        stream_info->setStandard();
+        return 0;
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return 0;     // the result value has already been set.
 }
 
 /**
@@ -3383,10 +3422,19 @@ const char *StreamInfo::getQualifiedName()
 /********************************************************************************************/
 RexxMethod1(CSTRING, qualify, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-    stream_info->setContext(context, context->NullString());
-
-    return stream_info->getQualifiedName();
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        return stream_info->getQualifiedName();
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return 0;     // the result value has already been set.
 }
 
 
@@ -3434,10 +3482,19 @@ const char *StreamInfo::streamExists()
 /********************************************************************************************/
 RexxMethod1(CSTRING, query_exists, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-    stream_info->setContext(context, context->NullString());
-
-    return stream_info->streamExists();
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        return stream_info->streamExists();
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return 0;     // the result value has already been set.
 }
 
 /**
@@ -3459,9 +3516,19 @@ RexxObjectPtr StreamInfo::queryHandle()
 /********************************************************************************************/
 RexxMethod1(RexxObjectPtr, query_handle, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-    stream_info->setContext(context, context->NullString());
-    return stream_info->queryHandle();
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        return stream_info->queryHandle();
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return NULLOBJECT;     // the result value has already been set.
 }
 
 
@@ -3492,9 +3559,19 @@ const char *StreamInfo::getStreamType()
 /********************************************************************************************/
 RexxMethod1(CSTRING, query_streamtype, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-
-    return stream_info->getStreamType();
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        return stream_info->getStreamType();
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return 0;     // the result value has already been set.
 }
 
 /**
@@ -3557,10 +3634,19 @@ const char *StreamInfo::getTimeStamp()
 /********************************************************************************************/
 RexxMethod1(RexxObjectPtr, query_size, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-    stream_info->setContext(context, context->NullString());
-
-    return stream_info->getStreamSize();
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        return stream_info->getStreamSize();
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return NULLOBJECT;     // the result value has already been set.
 }
 
 
@@ -3569,10 +3655,19 @@ RexxMethod1(RexxObjectPtr, query_size, CSELF, streamPtr)
 /********************************************************************************************/
 RexxMethod1(CSTRING, query_time, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-    stream_info->setContext(context, context->NullString());
-
-    return stream_info->getTimeStamp();
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        return stream_info->getTimeStamp();
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return 0;     // the result value has already been set.
 }
 
 /**
@@ -3606,10 +3701,19 @@ const char *StreamInfo::getState()
 /********************************************************************************************/
 RexxMethod1(CSTRING, stream_state, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-    stream_info->setContext(context, context->NullString());
-
-    return stream_info->getState();
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        return stream_info->getState();
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return 0;     // the result value has already been set.
 }
 
 
@@ -3644,12 +3748,12 @@ RexxStringObject StreamInfo::getDescription()
             if (errorString != NULL)
             {
                                                  /* format the result string          */
-                snprintf(work, sizeof(work), "NOTREADY:%d %s", errorInfo, errorString);
+                snprintf(work, sizeof(work), "NOTREADY:%d %s", HOST_ERRNO(errorInfo), errorString);
             }
             else
             {
                                                  /* format the result string          */
-                snprintf(work, sizeof(work), "NOTREADY:%d", errorInfo);
+                snprintf(work, sizeof(work), "NOTREADY:%d", HOST_ERRNO(errorInfo));
 
             }
             return context->NewStringFromAsciiz(work);
@@ -3666,12 +3770,12 @@ RexxStringObject StreamInfo::getDescription()
             if (errorString != NULL)
             {
                                                  /* format the result string          */
-                snprintf(work, sizeof(work), "ERROR:%d %s", errorInfo, errorString);
+                snprintf(work, sizeof(work), "ERROR:%d %s", HOST_ERRNO(errorInfo), errorString);
             }
             else
             {
                                                  /* format the result string          */
-                snprintf(work, sizeof(work), "ERROR:%d", errorInfo);
+                snprintf(work, sizeof(work), "ERROR:%d", HOST_ERRNO(errorInfo));
 
             }
             return context->NewStringFromAsciiz(work);
@@ -3690,10 +3794,19 @@ RexxStringObject StreamInfo::getDescription()
 
 RexxMethod1(RexxStringObject, stream_description, CSELF, streamPtr)
 {
-    StreamInfo *stream_info = (StreamInfo *)streamPtr;
-    stream_info->setContext(context, context->NullString());
-
-    return stream_info->getDescription();
+    try
+    {
+        StreamInfo *stream_info = checkStreamInfo(context, streamPtr, context->NullString());
+        return stream_info->getDescription();
+    }
+    // this is thrown for any exceptions
+    catch (int)
+    {
+    }
+    catch (StreamInfo *)
+    {
+    }
+    return NULLOBJECT;     // the result value has already been set.
 }
 
 /**
@@ -3709,6 +3822,7 @@ StreamInfo::StreamInfo(RexxObjectPtr s, const char *inputName)
     // buffer needs to be allocated
     bufferAddress = NULL;
     bufferLength = 0;
+    handle_value = -1;
 
     // initialize the default values
     resetFields();

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2023 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -93,35 +93,6 @@ void MicrosecondsToFileTime(uint64_t usecs, FILETIME &timeStamp)
 
     timeStamp.dwHighDateTime = (DWORD)(temp >> 32);
     timeStamp.dwLowDateTime = (DWORD)temp;
-}
-
-/**
- * Search for a given filename, returning the fully
- * resolved name if it is found.
- *
- * @param name     The input search name.
- * @param fullName The returned fully resolved name.
- * @param fullNameLength
- *                 length of the full name return buffer
- *
- * @return True if the file was located, false otherwise.
- */
-bool SysFileSystem::searchFileName(const char *name, FileNameBuffer &fullName)
-{
-    // try to resolve the path name
-    if (getFullPathName(name, fullName))
-    {
-        // this must be a file.
-        return isFile(fullName);
-    }
-
-    // search on the path...also must be a file
-    if (searchOnPath(name, NULL, NULL, fullName))
-    {
-        return isFile(fullName);
-    }
-
-    return false;
 }
 
 
@@ -493,6 +464,69 @@ bool SysFileSystem::searchName(const char *name, const char *path, const char *e
 
 
 /**
+ * Test if a name starts with ".\" or "..\" (or "./" or "../").
+ *
+ * @param name   The name to check.
+ *
+ * @return true if the name is relative to "." or "..".
+ */
+static bool startsWithDotDirectory(const char *name)
+{
+    return (name[0] == '.' && (name[1] == '\\' || name[1] == '/')) ||
+           (name[0] == '.' && name[1] == '.' && (name[2] == '\\' || name[2] == '/'));
+}
+
+
+/**
+ * Search for a name starting with ".\" or "..\" in each directory of a
+ * search path. SearchPath() does not search for such names, so we do it
+ * here: "..\name" is looked for in the parent of each directory.
+ *
+ * @param name      The name to search for.
+ * @param path      The search path, with ';' separated entries (can be NULL).
+ * @param resolvedName
+ *                  The buffer used to return the resolved file name.
+ *
+ * @return true if the file was located.
+ */
+static bool searchDotNameOnPath(const char *name, const char *path, FileNameBuffer &resolvedName)
+{
+    if (path != NULL)
+    {
+        AutoFileNameBuffer candidate(resolvedName);
+
+        for (const char *p = path; *p != '\0'; )
+        {
+            const char *q = strchr(p, ';');
+            size_t length = (q == NULL) ? strlen(p) : (size_t)(q - p);
+
+            // skip empty entries, the ";;" in a path case
+            if (length != 0)
+            {
+                candidate.set(p, length);
+                if (!candidate.endsWith('\\') && !candidate.endsWith('/'))
+                {
+                    candidate += '\\';
+                }
+                candidate += name;
+                if (SysFileSystem::checkCurrentFile(candidate, resolvedName))
+                {
+                    return true;
+                }
+            }
+            if (q == NULL)
+            {
+                break;
+            }
+            p = q + 1;
+        }
+    }
+    resolvedName = "";
+    return false;
+}
+
+
+/**
  * Do a search for a single variation of a filename.
  *
  * NOTE:  This version does not do anything with the
@@ -528,6 +562,13 @@ bool SysFileSystem::primitiveSearchName(const char *name, const char *path, cons
         return checkCurrentFile(tempName, resolvedName);
     }
 
+    // names starting with ".\" or "..\" are relative, and searched for in
+    // every directory of the search order, like any other relative name
+    if (startsWithDotDirectory(tempName))
+    {
+        return searchDotNameOnPath(tempName, path, resolvedName);
+    }
+
     if (searchOnPath(tempName, path, NULL, resolvedName))
     {
         return true;
@@ -549,9 +590,9 @@ bool SysFileSystem::hasDirectory(const char *name)
     // hasDirectory() means we have enough absolute directory
     // information at the beginning to bypass performing path searches.
     // (there are more ways to specify a drive than just d: but still ..)
-    return name[0] == '\\' || name[1] == ':' ||
-          (name[0] == '.' && name[1] == '\\') ||
-          (name[0] == '.' && name[1] == '.' && name[2] == '\\');
+    // Names starting with ".\" or "..\" are relative, and are searched for
+    // along the path (see primitiveSearchName).
+    return name[0] == '\\' || name[1] == ':';
 }
 
 
@@ -598,6 +639,12 @@ bool SysFileSystem::checkCurrentFile(const char *name, FileNameBuffer &resolvedN
  */
 bool SysFileSystem::searchPath(const char *name, const char *path, FileNameBuffer &resolvedName)
 {
+    // SearchPath() does not search for names starting with ".\" or "..\"
+    if (startsWithDotDirectory(name))
+    {
+        return searchDotNameOnPath(name, path, resolvedName);
+    }
+
     if (searchOnPath(name, path, NULL, resolvedName))
     {
         // if this is a file, return the long name

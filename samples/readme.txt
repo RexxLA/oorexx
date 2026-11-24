@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2023 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -47,6 +47,8 @@
 - arithmeticEvaluation.rex    an expression evaluator that builds a parse tree
 - arrayCallback.rex           perform a function over all elements in an array.
 - ccreply.rex                 concurrent program using REPLY
+- cmdhandlers.cls             command environments written in Rexx: a collection
+                              of classes that inherit CommandHandler
 - complex.cls                 complex number class
 - concurrency.rex             demonstrate multi-threaded execution with
                               syncronization
@@ -60,6 +62,9 @@
 - guess.rex                   a guessing game
 - interface.rex               define an interface class in ooRexx
 - ktguard.rex                 concurrent program using START and GUARD
+- ledit.cls                   a command environment in a package: a small line
+                              editor, registered in the package's prolog
+- ledwords.rex                edit macro for ledit.cls: count the words
 - makestring.rex              program that uses makestring method
 - month.rex                   displays days of the month of January
 - native.api                  folder with examples using the C++ native APIs
@@ -88,7 +93,9 @@
 - treeDirectory.cls           directory implementation using a balanced
                               binary tree
 - treeTraversal.rex           build a binary tree and demonstrate traversal
+- usecmdhandlers.rex          program that uses cmdhandlers.cls
 - usecomp.rex                 program that uses complex.cls
+- useledit.rex                program that uses ledit.cls and ledwords.rex
 - usepipe.rex                 program that uses pipe.cls
 - usesingleton.rex            program that uses singleton.cls
 - usetree.rex                 show that a treeDirectory is polymorphic with

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -66,6 +66,7 @@ GLOBAL_NAME(BLANK, " ")
 GLOBAL_NAME(BRACKETS, "[]")
 GLOBAL_NAME(BY, "BY")
 GLOBAL_NAME(CALL, "CALL")
+GLOBAL_NAME(CATCH, "CATCH")
 GLOBAL_NAME(CASE, "CASE")
 GLOBAL_NAME(CHAR, "CHAR")
 GLOBAL_NAME(CHARIN, "CHARIN")
@@ -231,6 +232,7 @@ GLOBAL_NAME(ASSIGNMENT_SUBTRACT, "-=")
 GLOBAL_NAME(SUPER, "SUPER")
 GLOBAL_NAME(SUPPLIER, "SUPPLIER")
 GLOBAL_NAME(SYNTAX, "SYNTAX")
+GLOBAL_NAME(THROWN, "THROWN")
 GLOBAL_NAME(TO, "TO")
 GLOBAL_NAME(TRACEBACK, "TRACEBACK")
 GLOBAL_NAME(TRACEOUTPUT, "TRACEOUTPUT")
@@ -269,6 +271,7 @@ GLOBAL_NAME(INVOCATION,          "INVOCATION")          // TraceObject: a counte
 GLOBAL_NAME(ISGUARDED,           "ISGUARDED")           // TraceObject: .true/.false (method definition)
 GLOBAL_NAME(ISWAITING,           "ISWAITING")           // TraceObject: .true/.false (.true if guard condition yields "0")
 GLOBAL_NAME(LINE,                "LINE")                // TraceObject: message and index name (StackFrame and StringTable)
+GLOBAL_NAME(NOTIFY,              "NOTIFY")              // TraceObject: NOTIFY class object attribute
 GLOBAL_NAME(OPTION,              "OPTION")              // TraceObject: option at creation time
 GLOBAL_NAME(RECEIVER,            "RECEIVER")            // TraceObject: the receiver of a message
 GLOBAL_NAME(SCOPELOCKCOUNT,      "SCOPELOCKCOUNT")      // TraceObject: a counter (number, reserveCount)
@@ -280,3 +283,11 @@ GLOBAL_NAME(TRACEOBJECT,         "TRACEOBJECT")         // TraceObject: class na
 GLOBAL_NAME(TYPE,                "TYPE")                // TraceObject: message and index name (StackFrame and StringTable)
 GLOBAL_NAME(VARIABLE,            "VARIABLE")            // TraceObject: a StringTable with NAME, VALUE, ASSIGNMENT: .true/.false
 
+GLOBAL_NAME(PROLOG,              "PROLOG")              // Package: Options method
+GLOBAL_NAME(NOPROLOG,            "NOPROLOG")            // Package: Options method
+GLOBAL_NAME(COMMANDS,            "COMMANDS")            // TraceSetting (cf. Package: Options method)
+GLOBAL_NAME(INTERMEDIATES,       "INTERMEDIATES")       // TraceSetting (cf. Package: Options method)
+GLOBAL_NAME(LABELS,              "LABELS")              // TraceSetting (cf. Package: Options method)
+GLOBAL_NAME(RESULTS,             "RESULTS")             // TraceSetting (cf. Package: Options method)
+
+GLOBAL_NAME(NOINHERIT,           "NOINHERIT")           // new ::options subdirective numeric

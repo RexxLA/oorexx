@@ -1,6 +1,6 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
-/* Copyright (c) 2012-2017 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2012-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -36,22 +36,31 @@
 /*----------------------------------------------------------------------------*/
 /******************************************************************************/
 /*                                                                            */
-/*   main entry point to REXX for unix-based systems                          */
+/*  Description:        Call the REXX interpreter using the command           */
+/*                      line arguments.                                       */
+/*                                                                            */
+/*  Entry Points:       main - main entry point                               */
+/*                                                                            */
 /*                                                                            */
 /******************************************************************************/
+
+#ifdef WINDOWS
+#include <windows.h>
+#endif
 
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <string>
 
-#include "oorexxapi.h"
-
+#include <oorexxapi.h>
 
 int main (int argc, char **argv) {
     int   i;                             /* loop counter                      */
     int   rc = 0;                        /* actually running program RC       */
+    int   argc_base = 2;                 /* the first argument for the program*/
     const char *program_name = NULL;     /* name to run                       */
-    char  arg_buffer[8192];              /* starting argument buffer          */
+    std::string arg_buffer;              // the single argument string, any length
     const char *cp;                      /* option character pointer          */
     CONSTRXSTRING argument;              /* rexxstart argument                */
     size_t argCount = 0;
@@ -67,7 +76,9 @@ int main (int argc, char **argv) {
     RexxDirectoryObject  dir;
     RexxObjectPtr        result;
 
-    arg_buffer[0] = '\0';                /* default to no argument string     */
+    wholenumber_t overrideCount = 0;        // +1 one time (switch -o), -1 always=global (switch -og)
+    char          overrideString[512] = ""; // "::OPTIONS" directive string
+
     for (i = 1; i < argc; i++) {         /* loop through the arguments        */
                                          /* is this option a switch?          */
         if (program_name == NULL && (*(cp=*(argv+i)) == '-')) {
@@ -85,6 +96,37 @@ int main (int argc, char **argv) {
                     real_argument = false;
                     break;
 
+                case 'o':     // override package options, cf. Package' globalOptions documentation
+                case 'O': {
+                    if ( argc == i+1 ) {
+                      break;
+                    }
+                    overrideCount = 1;  // default to a one time override (for program_name only)
+                    char c = *(cp+1);   // get second character
+                    if ( c=='d' || c=='D' ) // override package default options, unless explicitly defined in package
+                    {
+                        overrideCount = -1; // override globally
+                    }
+                    argc_base += 2;     // skip the two arguments (switch and setting)
+
+                    // advance to next: must start with "some option settings"
+                    i++;    // position on options string argument
+                    char *argOptionsString=argv[i];   // options string
+                    bool startsWithDirective=false;
+                    int k=0;
+                    while (argOptionsString[k++]==' ');     // skip over leading blanks
+                    if (argOptionsString[k]==':')           // do we have a start of a directive?
+                    {
+                        snprintf(overrideString, 512, "%s", argOptionsString);
+                    }
+                    else    // prepend "::OPTIONS " (therefore it can be left out on the command line)
+                    {
+                        snprintf(overrideString, 512, "::OPTIONS %s", argOptionsString);
+                    }
+                    real_argument = false;
+                    break;
+                }
+
                 case 'v': case 'V':      /* display version string            */
                     ptr = RexxGetVersionInformation();
                     fprintf(stdout, "%s\n", ptr);
@@ -92,15 +134,16 @@ int main (int argc, char **argv) {
                     return 0;
 
                 default:                 /* ignore other switches             */
+                    argc_base++;
                     break;
             }
         } else {                         /* convert into an argument string   */
             if (program_name == NULL) {  /* no name yet?                      */
                 program_name = argv[i];  /* program is first non-option       */
             } else if (real_argument) {
-                if (arg_buffer[0] != '\0') /* not the first one?              */
-                    strcat(arg_buffer, " "); /* add an blank                  */
-                strcat(arg_buffer, argv[i]);  /* add this to the arg string   */
+                if (!arg_buffer.empty()) /* not the first one?                */
+                    arg_buffer += ' ';   /* add an blank                      */
+                arg_buffer += argv[i];   /* add this to the arg string        */
                 ++argCount;
             }
             real_argument = true;
@@ -110,7 +153,7 @@ int main (int argc, char **argv) {
     if (program_name == NULL)  {
                                          /* give a simple error message       */
         fprintf(stderr,"\n");
-        fprintf(stderr,"Syntax is \"rexx filename [arguments]\"\n");
+        fprintf(stderr,"Syntax is \"rexx [-o[d] \"options\"] filename [arguments]\"\n");
         fprintf(stderr,"or        \"rexx -e program_string [arguments]\"\n");
         fprintf(stderr,"or        \"rexx -v\".\n");
         return -1;
@@ -118,7 +161,7 @@ int main (int argc, char **argv) {
 
     argCount = (argCount==0) ? 0 : 1;    /* is there an argument ?            */
                                          /* make an argument                  */
-    MAKERXSTRING(argument, arg_buffer, strlen(arg_buffer));
+    MAKERXSTRING(argument, arg_buffer.c_str(), arg_buffer.length());
                                          /* run this via RexxStart            */
 
     if (from_string) {
@@ -138,31 +181,50 @@ int main (int argc, char **argv) {
         if (argCount > 0) {
             rxargs = pgmThrdInst->NewArray(1);
             pgmThrdInst->ArrayPut(rxargs,
-                                  pgmThrdInst->NewStringFromAsciiz(arg_buffer), 1);
+                                  pgmThrdInst->NewString(arg_buffer.c_str(), arg_buffer.length()), 1);
         } else {
             rxargs = pgmThrdInst->NewArray(0);
         }
         // set up the C args into the .local environment
         dir = (RexxDirectoryObject)pgmThrdInst->GetLocalEnvironment();
-        if ( argc > 2 )
+        if ( argc > argc_base )
         {
-            rxcargs = pgmThrdInst->NewArray(argc - 2);
+            rxcargs = pgmThrdInst->NewArray(argc - argc_base);
         }
         else
         {
             rxcargs = pgmThrdInst->NewArray(0);
         }
-        for (i = 2; i < argc; i++) {
+        for (i = argc_base; i < argc; i++) {
             pgmThrdInst->ArrayPut(rxcargs,
                                   pgmThrdInst->NewStringFromAsciiz(argv[i]),
                                   i - 1);
         }
         pgmThrdInst->DirectoryPut(dir, rxcargs, "SYSCARGS");
+
         // call the interpreter
-        result = pgmThrdInst->CallProgram(program_name, rxargs);
+        if (overrideCount != 0)     // set override global package options
+        {
+            // if something goes wrong a condition will be set
+            RexxObjectPtr clzPackage = pgmThrdInst -> FindClass("PACKAGE");
+            // set override options
+            result  = pgmThrdInst -> SendMessage2(clzPackage, "DEFAULTOPTIONS",
+                                          pgmThrdInst -> CString("D"),      // DefineDefaultOptions
+                                          pgmThrdInst -> NewStringFromAsciiz(overrideString));
+            result  = pgmThrdInst -> SendMessage2(clzPackage, "DEFAULTOPTIONS",
+                                          pgmThrdInst -> CString("C"),      // CountOverrides
+                                          pgmThrdInst -> Int64ToObject(overrideCount));
+        }
+
+        if (!pgmThrdInst->CheckCondition()) // if no condition got raised so far, call the program
+        {
+            // call the interpreter
+            result = pgmThrdInst->CallProgram(program_name, rxargs);
+        }
+
         // display any error message if there is a condition.
         // if there was an error, then that will be our return code
-        rc = pgmThrdInst->DisplayCondition();
+        rc = (int) pgmThrdInst->DisplayCondition();
         if (rc != 0) {
             pgmInst->Terminate();
             return -rc;   // well, the negation of the error number is the return code

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -67,10 +67,13 @@ class RequiresDirective;
 class CommandIOConfiguration;
 class CommandIOContext;
 class RoutineClass;
+class TrapHandler;
 
 /**
  * An activation of a section of Rexx code.
  */
+class RexxInstructionCatch;
+
 class RexxActivation : public ActivationBase
 {
   public:
@@ -120,8 +123,8 @@ class RexxActivation : public ActivationBase
 
    inline RexxActivation(RESTORETYPE restoreType) { ; };
    RexxActivation();
-   RexxActivation(Activity* _activity, MethodClass *_method, RexxCode *_code);
-   RexxActivation(Activity *_activity, RoutineClass *_routine, RexxCode *_code, RexxString *calltype, RexxString *env, ActivationContext context);
+   RexxActivation(Activity* _activity, RexxActivation *_parent, MethodClass *_method, RexxCode *_code);
+   RexxActivation(Activity *_activity, RexxActivation *_parent, RoutineClass *_routine, RexxCode *_code, RexxString *calltype, RexxString *env, ActivationContext context);
    RexxActivation(Activity *_activity, RexxActivation *_parent, RexxCode *_code, ActivationContext context);
 
    void live(size_t) override;
@@ -152,6 +155,7 @@ class RexxActivation : public ActivationBase
    MethodClass     *getMethod();
 
    void        inheritPackageSettings();
+   void        inhibitTrace();
    void        allocateStackFrame();
    void        allocateLocalVariables();
    inline void guardOff()
@@ -184,7 +188,7 @@ class RexxActivation : public ActivationBase
    }
    void              reply(RexxObject *);
    RexxObject      * forward(RexxObject *, RexxString *, RexxClass *, RexxObject **, size_t, bool);
-   void              returnFrom(RexxObject *result);
+   void              returnFrom(RexxObject *result, bool raising = false);
    void              exitFrom(RexxObject *);
    void              procedureExpose(RexxVariableBase **variables, size_t count);
    void              expose(RexxVariableBase **variables, size_t count);
@@ -198,12 +202,52 @@ class RexxActivation : public ActivationBase
    ActivationBase  * senderActivation(RexxString *conditionName);
    RexxActivation  * external();
    void              interpret(RexxString *);
-   void              signalTo(RexxInstruction *);
+   void              signalTo(RexxInstruction *, bool trapped = false);
+   void              signalTrap(RexxInstruction *, DirectoryClass *);
+   void              setTrapRc(DirectoryClass *);
    void              guardWait();
    void              debugSkip(wholenumber_t);
    RexxString      * traceSetting();
    void              iterate(RexxString *);
    void              leaveLoop(RexxString *);
+   bool              findCatch(RexxString *condition, DirectoryClass *conditionObj, RexxActivation *&owner, DoBlock *&block, RexxInstructionCatch *&clause);
+   void              processCatch();
+   bool              catches(RexxString *condition, DirectoryClass *conditionObj = OREF_NULL);
+   bool              hasCatchBlocks();
+   bool              enabledBelow(TrapHandler *trap, RexxActivation *owner);
+   // FINALLY clauses (RFE #31)
+   typedef enum
+   {
+       FINALLY_SCOPE_BLOCKS,       // LEAVE, ITERATE: the blocks down to the target
+       FINALLY_SCOPE_CODE,         // RETURN, SIGNAL, FORWARD: this code, and what INTERPRETs it
+       FINALLY_SCOPE_BODY,         // EXIT: up to the top level of the code body
+   } FinallyScope;
+   bool              hasFinallyToRun();
+   bool              leaveBlocks(DoBlock *until, FinallyAction action, RexxInternalObject *object = OREF_NULL,
+                                 RexxInstruction *instruction = OREF_NULL, DoBlock *block = OREF_NULL);
+   void              startFinally(DoBlock *block);
+   // the usual case, a block with no FINALLY clause to run, costs a test
+   inline bool       enterFinally(DoBlock *block)
+   {
+       return block != OREF_NULL && block->hasFinallyToRun() && startFinallyAtEnd(block);
+   }
+   bool              startFinallyAtEnd(DoBlock *block);
+   void              endFinally(DoBlock *block, RexxInstruction *end);
+   // nothing to check unless the code of a FINALLY clause is running, here
+   // or in the code that runs this INTERPRET or internal routine
+   inline void       checkFinallyExit(const char *keyword, FinallyScope scope, DoBlock *last = OREF_NULL)
+   {
+       if (finallyRunning == 0 && (scope == FINALLY_SCOPE_BLOCKS ||
+           (scope == FINALLY_SCOPE_CODE ? !isInterpret() : isTopLevelCall())))
+       {
+           return;
+       }
+       findFinallyExit(keyword, scope, last);
+   }
+   void              findFinallyExit(const char *keyword, FinallyScope scope, DoBlock *last);
+   void              finallyBeforeTrap(RexxString *condition, DirectoryClass *exceptionObject);
+   TrapHandler     * findTrapHandler(RexxString *condition);
+   TrapHandler     * findTrapHandler(RexxString *condition, DirectoryClass *exceptionObject);
    void              trapOn(RexxString *, RexxInstructionTrapBase *, bool);
    void              trapOff(RexxString *, bool);
    void              setAddress(RexxString *, CommandIOConfiguration *config);
@@ -218,6 +262,10 @@ class RexxActivation : public ActivationBase
    RexxObject      * internalCallTrap(RexxString *, RexxInstruction *, DirectoryClass *, ProtectedObject &);
    bool              callMacroSpaceFunction(RexxString *, RexxObject **, size_t, RexxString *, int, ProtectedObject &);
    static RoutineClass* getMacroCode(RexxString *macroName);
+   // a counter that orders trap activations and the entries to internal
+   // routines (RFE #31)
+   static inline uint64_t nextSequence() { return ++sequenceCounter; }
+   static uint64_t sequenceCounter;
    RexxString       *resolveProgramName(RexxString *name, ResolveType type);
    RexxClass        *findClass(RexxString *name);
    RexxObject       *resolveDotVariable(RexxString *name, RexxObject *&);
@@ -253,7 +301,6 @@ class RexxActivation : public ActivationBase
    bool              halt(RexxString *);
    void              externalTraceOn();
    void              externalTraceOff();
-   void              yield();
    void              propagateExit(RexxObject *);
    void              setDefaultAddress(RexxString *);
    bool              internalMethod();
@@ -264,6 +311,7 @@ class RexxActivation : public ActivationBase
    RexxObject      * popEnvironment();
    bool              processTraps();
    void              mergeTraps(QueueClass *);
+   bool              isErrorPending(TrapHandler *, DirectoryClass *);
    uint64_t          getRandomSeed(RexxInteger *);
    VariableDictionary *getObjectVariables();
    StringTable     * getLabels();
@@ -298,6 +346,10 @@ class RexxActivation : public ActivationBase
    {
        removeBlockInstruction();
        DoBlock *temp = doStack;
+       if (temp->isInFinally())
+       {
+           finallyRunning--;
+       }
        doStack = temp->getPrevious();
        settings.traceIndent = temp->getIndent();
        temp->setHasNoReferences();
@@ -306,7 +358,13 @@ class RexxActivation : public ActivationBase
    inline DoBlock *topBlockInstruction() { return doStack; }
    inline void terminateBlockInstruction(size_t _indent) { popBlockInstruction(); settings.traceIndent = _indent; }
    inline void terminateBlockInstruction() { popBlockInstruction();  }
-   inline void newBlockInstruction(DoBlock *block) { pushBlockInstruction(block); blockNest++; settings.traceIndent++;}
+   inline void newBlockInstruction(DoBlock *block)
+   {
+       pushBlockInstruction(block);
+       blockNest++;
+       block->setNest(blockNest);
+       settings.traceIndent++;
+   }
    inline void removeBlockInstruction()
    {
        blockNest--;
@@ -631,6 +689,7 @@ class RexxActivation : public ActivationBase
     RexxInstruction     *current;       // current execution pointer
     RexxInstruction     *next;          // next instruction to execute
     bool                 debugPause;    // executing a debug pause
+    bool                 debugError;    // the line typed at a debug pause ended in an error
     bool                 clauseBoundary;// special flag for clause boundary checks
     bool                 traceEntryAllowed; // true if first instruction (other than expose)
     bool                 traceEntryDone;// true if the entry in a routine or method has been traced
@@ -649,7 +708,15 @@ class RexxActivation : public ActivationBase
     uint64_t             randomSeed;    // random number seed
     bool                 randomSet;     // random seed has been set
     size_t               blockNest;     // block instruction nesting level
+    size_t               finallyRunning; // active blocks whose FINALLY code is running
     size_t               instructionCount;  // The number of instructions since we last yielded control
     uint32_t             idntfr;        // idntfr for concurrency trace
+                                        // a condition caught by a CATCH clause, waiting
+                                        // for the unwind to reach this activation (RFE #31)
+    DoBlock             *catchBlock;    // the block that caught it
+    RexxInstructionCatch *catchClause;  // the CATCH clause that caught it
+    DirectoryClass      *catchCondition;// the condition object
+    uint64_t             entrySequence; // when this internal routine was entered (see TrapHandler)
+    RexxActivation      *catchAncestor; // the next activation whose blocks findCatch() looks at
  };
  #endif

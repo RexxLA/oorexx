@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2022 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -282,6 +282,12 @@ ArrayClass* ArrayClass::allocateNewObject(size_t size, size_t items, size_t maxS
     maxSize = std::max(maxSize, MinimumArraySize);
     // and use at least the size as the max
     maxSize = std::max(maxSize, items);
+    // the Rexx-level paths already check this, but a native API caller
+    // (NewArray) can pass any size, and the byte count below would wrap
+    if (maxSize > MaxFixedArraySize)
+    {
+        reportException(Error_Incorrect_method_array_too_big, MaxFixedArraySize);
+    }
     // add in the max size value.  Note that we subtract one since
     // the first item is contained in the base object allocation.
     bytes += sizeof(RexxInternalObject *) * (maxSize - 1);
@@ -430,6 +436,24 @@ void ArrayClass::checkMultiDimensional(const char *methodName)
         reportException(Error_Incorrect_method_array_dimension, methodName);
     }
 
+}
+
+
+/**
+ * INSERT and DELETE work only on single-dimensional arrays, so
+ * their index must be a single subscript.  The array's own index
+ * validation would accept more for an array that has no dimensions
+ * yet (.Array~new): INSERT then turned it into a multi-dimensional
+ * array, and DELETE went on without a position.
+ *
+ * @param index The index argument (a number, or an array of subscripts).
+ */
+static void requireSingleSubscript(RexxObject *index)
+{
+    if (index != OREF_NULL && isArray(index) && ((ArrayClass *)index)->items() > 1)
+    {
+        reportException(Error_Incorrect_method_maxsub, IntegerOne);
+    }
 }
 
 
@@ -748,6 +772,7 @@ size_t ArrayClass::append(RexxInternalObject *value)
 RexxObject* ArrayClass::insertRexx(RexxObject *value, RexxObject *index)
 {
     checkMultiDimensional("INSERT");
+    requireSingleSubscript(index);
 
     size_t position;                     // array position
 
@@ -821,6 +846,7 @@ RexxInternalObject* ArrayClass::deleteRexx(RexxObject *index)
 {
     requiredArgument(index, ARG_ONE);
     checkMultiDimensional("DELETE");
+    requireSingleSubscript(index);
 
     size_t position;                     // array position
 
@@ -1221,8 +1247,21 @@ bool ArrayClass::validateIndex(RexxObject **index, size_t indexCount,
         // we process this exactly the same way, but swap the count and
         // pointers around to be the array data.
         ArrayClass *indirect = (ArrayClass *)index[0];
-        indexCount = indirect->items();
+
+        // an index list must be single-dimensional and it must not be sparse
+        if (!indirect->isSingleDimensional())
+        {
+            reportException(Error_Incorrect_method_noarray, argPosition);
+        }
+        indexCount = indirect->size();
         index = (RexxObject **)indirect->data();
+        for (size_t i = 0; i < indexCount; i++)
+        {
+            if (index[i] == OREF_NULL)
+            {
+                reportException(Error_Execution_sparse_array, i + 1);
+            }
+        }
     }
 
     /* Is this array one-dimensional?    */

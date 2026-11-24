@@ -78,6 +78,7 @@ public:
     static RoutineClass *resolveRoutine(RexxString *function);
     static RoutineClass *createRegisteredRoutine(RexxString *function);
     static RoutineClass *getLoadedRoutine(RexxString *function);
+    static bool isRetiredRoutine(RexxString *name);
     static PNATIVEMETHOD resolveMethodEntry(RexxString *package, RexxString *name);
     static PNATIVEROUTINE resolveRoutineEntry(RexxString *package, RexxString *name);
     static PREGISTEREDROUTINE resolveRegisteredRoutineEntry(RexxString *package, RexxString *name);
@@ -99,7 +100,7 @@ public:
 protected:
 
     static PackageClass *checkRequiresCache(RexxString *name, Protected<PackageClass> &package);
-    static void addToRequiresCache(RexxString *name, PackageClass *package);
+    static void addToRequiresCache(RexxString *name, PackageClass *package, bool weak = true);
 
     enum
     {

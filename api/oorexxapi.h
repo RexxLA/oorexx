@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2022 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -238,20 +238,34 @@ typedef struct _RexxMethodEntry
 #define REXX_INTERPRETER_5_0_0  0x00050000
 #define REXX_INTERPRETER_5_1_0  0x00050100
 #define REXX_INTERPRETER_5_2_0  0x00050200
-#define REXX_CURRENT_INTERPRETER_VERSION REXX_INTERPRETER_5_2_0
+#define REXX_INTERPRETER_5_3_0  0x00050300
+#define REXX_CURRENT_INTERPRETER_VERSION REXX_INTERPRETER_5_3_0
 #define NO_VERSION_YET NULL
 
 #define REXX_LANGUAGE_6_03 0x00000603
 #define REXX_LANGUAGE_6_04 0x00000604
 #define REXX_LANGUAGE_6_05 0x00000605
-#define REXX_CURRENT_LANGUAGE_LEVEL REXX_LANGUAGE_6_05
+#define REXX_LANGUAGE_6_06 0x00000606
+#define REXX_LANGUAGE_6_07 0x00000607
+#define REXX_CURRENT_LANGUAGE_LEVEL REXX_LANGUAGE_6_07
 
 #define STANDARD_PACKAGE_HEADER sizeof(RexxPackageEntry), REXX_PACKAGE_API_NO,
 
+// OOREXX_GET_PACKAGE(name) defines RexxGetPackage(), the entry point the
+// interpreter looks for when it loads a library.  A library linked into a
+// program, rather than loaded as a shared library, is compiled with
+// OOREXX_EMBEDDED_PACKAGE defined: then the macro defines nothing (several
+// such libraries in one program would each define RexxGetPackage()), and the
+// program registers the library's package table itself (REGISTER_LIBRARY,
+// RegisterLibrary()).
+#if defined(OOREXX_EMBEDDED_PACKAGE)
+#define OOREXX_GET_PACKAGE(name)
+#else
 #define OOREXX_GET_PACKAGE(name) \
     BEGIN_EXTERN_C()\
     REXXEXPORT RexxPackageEntry *RexxGetPackage(void) { return &name##_package_entry; }\
     END_EXTERN_C()
+#endif
 
 
 typedef void (RexxEntry *RexxPackageLoader)(RexxThreadContext *);
@@ -472,7 +486,8 @@ typedef struct
 
 #define INSTANCE_INTERFACE_VERSION_4_0_0 100
 #define INSTANCE_INTERFACE_VERSION_5_0_0 101
-#define INSTANCE_INTERFACE_VERSION 101
+#define INSTANCE_INTERFACE_VERSION_5_3_0 102
+#define INSTANCE_INTERFACE_VERSION 102
 
 #define DIRECT_COMMAND_ENVIRONMENT 1
 #define REDIRECTING_COMMAND_ENVIRONMENT 2
@@ -488,13 +503,19 @@ typedef struct
     void        (RexxEntry *Halt)(RexxInstance *);
     void        (RexxEntry *SetTrace)(RexxInstance *, logical_t);
     void        (RexxEntry *AddCommandEnvironment)(RexxInstance *, const char *, REXXPFN, int);
+    // added in INSTANCE_INTERFACE_VERSION_5_3_0
+    logical_t   (RexxEntry *StackCommandEnvironment)(RexxInstance *, const char *, REXXPFN, int);
 } RexxInstanceInterface;
 
 #define THREAD_INTERFACE_VERSION_4_0_0 100
 #define THREAD_INTERFACE_VERSION_4_1_1 101
 #define THREAD_INTERFACE_VERSION_4_2_0 102
 #define THREAD_INTERFACE_VERSION_5_0_0 103
-#define THREAD_INTERFACE_VERSION 103
+// 104 was the 5.3.0 betas from r13329 to r13553, which had
+// RaiseConditionObject only (and in it a thrown condition was thrown
+// again); 105 adds ThrowObject, so that a package can check for it
+#define THREAD_INTERFACE_VERSION_5_3_0 105
+#define THREAD_INTERFACE_VERSION 105
 
 BEGIN_EXTERN_C()
 
@@ -668,6 +689,9 @@ typedef struct
      logical_t(RexxEntry *IsStringTable)(RexxThreadContext *, RexxObjectPtr);
      RexxObjectPtr(RexxEntry *SendMessageScoped)(RexxThreadContext *, RexxObjectPtr, CSTRING, RexxClassObject, RexxArrayObject);
      RexxInstance *(RexxEntry *GetInterpreterInstance)(RexxThreadContext *);
+     // added in THREAD_INTERFACE_VERSION_5_3_0
+     void             (RexxEntry *RaiseConditionObject)(RexxThreadContext *, RexxDirectoryObject);
+     void             (RexxEntry *ThrowObject)(RexxThreadContext *, RexxDirectoryObject);
 
 } RexxThreadInterface;
 
@@ -675,7 +699,8 @@ typedef struct
 #define METHOD_INTERFACE_VERSION_4_0_0 100
 #define METHOD_INTERFACE_VERSION_4_2_0 101
 #define METHOD_INTERFACE_VERSION_5_0_0 102
-#define METHOD_INTERFACE_VERSION 102
+#define METHOD_INTERFACE_VERSION_5_3_0 103
+#define METHOD_INTERFACE_VERSION 103
 
 typedef struct
 {
@@ -707,11 +732,14 @@ typedef struct
      void (RexxEntry *ThrowException2)(RexxMethodContext *, size_t, RexxObjectPtr, RexxObjectPtr);
      void (RexxEntry *ThrowException)(RexxMethodContext *, size_t, RexxArrayObject);
      void (RexxEntry *ThrowCondition)(RexxMethodContext *, CSTRING, RexxStringObject, RexxObjectPtr, RexxObjectPtr);
+     // added in METHOD_INTERFACE_VERSION_5_3_0
+     void (RexxEntry *Throw)(RexxMethodContext *, CSTRING, RexxObjectPtr, RexxStringObject, RexxObjectPtr);
 } MethodContextInterface;
 
 #define CALL_INTERFACE_VERSION_4_0_0 100
 #define CALL_INTERFACE_VERSION_5_0_0 101
-#define CALL_INTERFACE_VERSION 101
+#define CALL_INTERFACE_VERSION_5_3_0 102
+#define CALL_INTERFACE_VERSION 102
 
 typedef struct
 {
@@ -738,11 +766,14 @@ typedef struct
      void (RexxEntry *ThrowException2)(RexxCallContext *, size_t, RexxObjectPtr, RexxObjectPtr);
      void (RexxEntry *ThrowException)(RexxCallContext *, size_t, RexxArrayObject);
      void (RexxEntry *ThrowCondition)(RexxCallContext *, CSTRING, RexxStringObject, RexxObjectPtr, RexxObjectPtr);
+     // added in CALL_INTERFACE_VERSION_5_3_0
+     void (RexxEntry *Throw)(RexxCallContext *, CSTRING, RexxObjectPtr, RexxStringObject, RexxObjectPtr);
 } CallContextInterface;
 
 #define EXIT_INTERFACE_VERSION_4_0_0 100
 #define EXIT_INTERFACE_VERSION_5_0_0 101
-#define EXIT_INTERFACE_VERSION 101
+#define EXIT_INTERFACE_VERSION_5_3_0 102
+#define EXIT_INTERFACE_VERSION 102
 
 typedef struct
 {
@@ -758,6 +789,8 @@ typedef struct
      void (RexxEntry *ThrowException2)(RexxExitContext *, size_t, RexxObjectPtr, RexxObjectPtr);
      void (RexxEntry *ThrowException)(RexxExitContext *, size_t, RexxArrayObject);
      void (RexxEntry *ThrowCondition)(RexxExitContext *, CSTRING, RexxStringObject, RexxObjectPtr, RexxObjectPtr);
+     // added in EXIT_INTERFACE_VERSION_5_3_0
+     void (RexxEntry *Throw)(RexxExitContext *, CSTRING, RexxObjectPtr, RexxStringObject, RexxObjectPtr);
 } ExitContextInterface;
 
 
@@ -816,6 +849,10 @@ struct RexxInstance_
     {
         functions->AddCommandEnvironment(this, n, h, t);
     }
+    logical_t StackCommandEnvironment(const char *n, REXXPFN h, int t)
+    {
+        return functions->StackCommandEnvironment(this, n, h, t);
+    }
 #endif
 };
 
@@ -843,6 +880,11 @@ struct RexxThreadContext_
      void AddCommandEnvironment(const char *n, REXXPFN h, int t)
      {
          instance->AddCommandEnvironment(n, h, t);
+     }
+
+     logical_t StackCommandEnvironment(const char *n, REXXPFN h, int t)
+     {
+         return instance->StackCommandEnvironment(n, h, t);
      }
 
      void DetachThread()
@@ -1615,6 +1657,14 @@ struct RexxThreadContext_
      {
          functions->RaiseCondition(this, s1, s2, ao, o);
      }
+     void RaiseConditionObject(RexxDirectoryObject d)
+     {
+         functions->RaiseConditionObject(this, d);
+     }
+     void ThrowObject(RexxDirectoryObject d)
+     {
+         functions->ThrowObject(this, d);
+     }
      logical_t CheckCondition()
      {
          return functions->CheckCondition(this);
@@ -1683,6 +1733,10 @@ struct RexxMethodContext_
      void AddCommandEnvironment(const char *n, REXXPFN h, int t)
      {
          threadContext->AddCommandEnvironment(n, h, t);
+     }
+     logical_t StackCommandEnvironment(const char *n, REXXPFN h, int t)
+     {
+         return threadContext->StackCommandEnvironment(n, h, t);
      }
      RexxObjectPtr RequestGlobalReference(RexxObjectPtr o)
      {
@@ -2362,6 +2416,14 @@ struct RexxMethodContext_
      {
          threadContext->RaiseCondition(s1, s2, ao, o);
      }
+     void RaiseConditionObject(RexxDirectoryObject d)
+     {
+         threadContext->RaiseConditionObject(d);
+     }
+     void ThrowObject(RexxDirectoryObject d)
+     {
+         threadContext->ThrowObject(d);
+     }
      logical_t CheckCondition()
      {
          return threadContext->CheckCondition();
@@ -2405,6 +2467,10 @@ struct RexxMethodContext_
      void ThrowCondition(CSTRING s1, RexxStringObject s2, RexxObjectPtr ao, RexxObjectPtr o)
      {
          functions->ThrowCondition(this, s1, s2, ao, o);
+     }
+     void Throw(CSTRING n, RexxObjectPtr rc, RexxStringObject d, RexxObjectPtr a)
+     {
+         functions->Throw(this, n, rc, d, a);
      }
 
 
@@ -2536,6 +2602,10 @@ struct RexxCallContext_
      {
          threadContext->AddCommandEnvironment(n, h, t);
      }
+     logical_t StackCommandEnvironment(const char *n, REXXPFN h, int t)
+     {
+         return threadContext->StackCommandEnvironment(n, h, t);
+     }
      RexxObjectPtr RequestGlobalReference(RexxObjectPtr o)
      {
          return threadContext->RequestGlobalReference(o);
@@ -3212,6 +3282,14 @@ struct RexxCallContext_
      {
          threadContext->RaiseCondition(s1, s2, ao, o);
      }
+     void RaiseConditionObject(RexxDirectoryObject d)
+     {
+         threadContext->RaiseConditionObject(d);
+     }
+     void ThrowObject(RexxDirectoryObject d)
+     {
+         threadContext->ThrowObject(d);
+     }
      logical_t CheckCondition()
      {
          return threadContext->CheckCondition();
@@ -3255,6 +3333,10 @@ struct RexxCallContext_
      void ThrowCondition(CSTRING s1, RexxStringObject s2, RexxObjectPtr ao, RexxObjectPtr o)
      {
          functions->ThrowCondition(this, s1, s2, ao, o);
+     }
+     void Throw(CSTRING n, RexxObjectPtr rc, RexxStringObject d, RexxObjectPtr a)
+     {
+         functions->Throw(this, n, rc, d, a);
      }
 
 
@@ -3367,6 +3449,10 @@ struct RexxExitContext_
      {
          threadContext->AddCommandEnvironment(n, h, t);
      }
+     logical_t StackCommandEnvironment(const char *n, REXXPFN h, int t)
+     {
+         return threadContext->StackCommandEnvironment(n, h, t);
+     }
      RexxObjectPtr RequestGlobalReference(RexxObjectPtr o)
      {
          return threadContext->RequestGlobalReference(o);
@@ -4042,6 +4128,14 @@ struct RexxExitContext_
      {
          threadContext->RaiseCondition(s1, s2, ao, o);
      }
+     void RaiseConditionObject(RexxDirectoryObject d)
+     {
+         threadContext->RaiseConditionObject(d);
+     }
+     void ThrowObject(RexxDirectoryObject d)
+     {
+         threadContext->ThrowObject(d);
+     }
      logical_t CheckCondition()
      {
          return threadContext->CheckCondition();
@@ -4085,6 +4179,10 @@ struct RexxExitContext_
      void ThrowCondition(CSTRING s1, RexxStringObject s2, RexxObjectPtr ao, RexxObjectPtr o)
      {
          functions->ThrowCondition(this, s1, s2, ao, o);
+     }
+     void Throw(CSTRING n, RexxObjectPtr rc, RexxStringObject d, RexxObjectPtr a)
+     {
+         functions->Throw(this, n, rc, d, a);
      }
 
      RexxObjectPtr Nil()

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2019 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -50,24 +50,60 @@
 #include "GlobalProtectedObject.hpp"
 
 // The currently active activity.
-Activity *volatile ActivityManager::currentActivity = OREF_NULL;
+std::atomic<Activity *> ActivityManager::currentActivity(OREF_NULL);
 
 // this is a volatile variable used to ensure instruction ordering
-volatile bool ActivityManager::sentinel = false;
+std::atomic<bool> ActivityManager::sentinel(false);
 
 // available activities we can reuse
 QueueClass *ActivityManager::availableActivities = OREF_NULL;
 
-// table of all activities
-QueueClass *ActivityManager::allActivities = OREF_NULL;
+/**
+ * The table of all activities. Deliberately allocated and never destroyed: see
+ * the declaration for why a static destructor would be a hazard here.
+ */
+ActivityList &ActivityManager::allActivities()
+{
+    static ActivityList *theList = new ActivityList();
+    return *theList;
+}
 
-std::deque<Activity *>ActivityManager::waitingActivities;   // queue of waiting activities
+/**
+ * The dispatch queue and the lock that guards it, reachable only via
+ * DispatchSection.  See the note on the declaration for why this is a
+ * function-local static rather than a namespace-scope object.
+ */
+WaitingActivityQueue::Data &WaitingActivityQueue::instance()
+{
+    static Data theData;
+    return theData;
+}
 
-size_t ActivityManager::waitingAttaches = 0;                // count of waiting external attaches
 
-size_t ActivityManager::waitingAccess = 0;                  // count of activities currently awaiting access
+/**
+ * The global kernel lock.  Function-local static, as above.
+ */
+SysMutex &ActivityManager::kernelLock()
+{
+    static SysMutex theLock;
+    return theLock;
+}
 
-size_t ActivityManager::waitingApiAccess = 0;               // count of activities currently awaiting API access
+
+/**
+ * The process termination semaphore.  Function-local static, as above.
+ */
+SysSemaphore &ActivityManager::terminationLock()
+{
+    static SysSemaphore theSem;
+    return theSem;
+}
+
+std::atomic<size_t> ActivityManager::waitingAttaches(0);                // count of waiting external attaches
+
+std::atomic<size_t> ActivityManager::waitingAccess(0);                  // count of activities currently awaiting access
+
+std::atomic<size_t> ActivityManager::waitingApiAccess(0);               // count of activities currently awaiting API access
 
 uint64_t ActivityManager::lastLockTime = 0;                 // the last time we granted the kernel lock.
 
@@ -77,12 +113,6 @@ bool ActivityManager::processTerminating = false;
 // number of active interpreter instances in this process
 size_t ActivityManager::interpreterInstances = 0;
 
-// global lock for the interpreter
-SysMutex ActivityManager::kernelSemaphore;
-
-// the termination complete semaphore
-SysSemaphore ActivityManager::terminationSem;
-
 
 /**
  * Initialize the activity manager when the interpreter starts up.
@@ -90,7 +120,15 @@ SysSemaphore ActivityManager::terminationSem;
 void ActivityManager::init()
 {
     availableActivities = new_queue();
-    allActivities = new_queue();
+    // Defensive only. init() runs once per process, from memoryObject.initialize()
+    // via startInterpreter(), whose body is guarded by !isActive(), and active is
+    // never cleared -- so no activity exists yet and this list is always already
+    // empty. It must NOT be re-entered with a populated list: clearing one would
+    // unroot live activities, which is as fatal as keeping stale pointers.
+    {
+        ResourceSection lock;
+        allActivities().clear();
+    }
     currentActivity = OREF_NULL;
 }
 
@@ -103,7 +141,18 @@ void ActivityManager::init()
 void ActivityManager::live(size_t liveMark)
 {
     memory_mark(availableActivities);
-    memory_mark(allActivities);
+    // the list is not a Rexx object, but its contents are, and this is what keeps
+    // the activities alive. We already hold kernel access here, so taking the
+    // resource lock the maintaining paths hold is the permitted order.
+    {
+        ResourceSection lock;
+        std::vector<Activity *> &acts = allActivities().contents();
+        for (size_t i = 0; i < acts.size(); i++)
+        {
+            RexxInternalObject *entry = acts[i];
+            memory_mark(entry);
+        }
+    }
 }
 
 /**
@@ -119,7 +168,17 @@ void ActivityManager::liveGeneral(MarkReason reason)
     if (reason != SAVINGIMAGE)
     {
         memory_mark_general(availableActivities);
-        memory_mark_general(allActivities);
+        {
+            ResourceSection lock;
+            std::vector<Activity *> &acts = allActivities().contents();
+            for (size_t i = 0; i < acts.size(); i++)
+            {
+                // markGeneral can update the reference, so write it back
+                RexxInternalObject *entry = acts[i];
+                memory_mark_general(entry);
+                acts[i] = (Activity *)entry;
+            }
+        }
     }
 }
 
@@ -163,7 +222,7 @@ void ActivityManager::addWaitingActivity(Activity *waitingAct, bool release )
         inWaitQueue = true;
 
         // add to the end
-        waitingActivities.push_back(waitingAct);
+        lock.add(waitingAct);
     }
     // if there is a current activity, then wait until dispatched.
     else if (currentActivity != OREF_NULL)
@@ -172,7 +231,7 @@ void ActivityManager::addWaitingActivity(Activity *waitingAct, bool release )
         inWaitQueue = true;
 
         // add to the end
-        waitingActivities.push_back(waitingAct);
+        lock.add(waitingAct);
     }
 
     // we're going to wait until posted, so make sure the run semaphore is cleared
@@ -180,8 +239,13 @@ void ActivityManager::addWaitingActivity(Activity *waitingAct, bool release )
     waitingAct->clearRunWait();
 
     // if we have a recursive reentry while waiting on either semaphore, we'll need to
-    // know later that this activity is in the dispatch queue so it can be removed from the
-    // queue until the context is unwound.
+    // know later that this activity is waiting for the kernel lock, so that it can be
+    // taken out of the waiters (and out of the dispatch queue, if it is there) until the
+    // context is unwound.  The flag does not mean that the activity is in the queue: it
+    // is set here even when it was not queued above, and so is waitingAccess.  The places
+    // that take this activity out of the queue (suspendDispatch() and the timeout case
+    // below) look for this very activity, so not being there is harmless.
+    // See bug #2073.
     waitingAct->setWaitingForDispatch();
 
     lock.release();                    // release the lock now
@@ -225,19 +289,9 @@ void ActivityManager::addWaitingActivity(Activity *waitingAct, bool release )
     // ok, we have the kernel lock and the resource lock. If we did not have a timeout while
     // waiting for dispatch, then we should still be in the queue and we need to remove our entry.
     // if we were posted, then the posting thread already removed our entry.
-    if (timedOut && !waitingActivities.empty())
+    if (timedOut)
     {
-        // search for the activity position and remove it.
-        for (std::deque<Activity *>::iterator it = waitingActivities.begin(); it != waitingActivities.end(); ++it)
-        {
-            // if this is found, remove it from the queue
-            if (*it == waitingAct)
-            {
-                waitingActivities.erase(it);
-                break;
-            }
-        }
-        // ignore this if not found.
+        lock.remove(waitingAct);
     }
 
     // the setting of the sentinel variables acts as a memory barrier to
@@ -262,9 +316,12 @@ void ActivityManager::addWaitingApiActivity(Activity *waitingAct)
     waitingAccess++;                     // indicate that we are waiting for access
     waitingApiAccess++;                  // indicate that we are waiting on behalf of an API call.
 
-    // if we have a recursive reentry while waiting on either semaphore, we'll need to
-    // know later that this activity is in the dispatch queue so it can be removed from the
-    // queue until the context is unwound.
+    // if we have a recursive reentry while waiting on the kernel semaphore, we'll need to
+    // know later that this activity is waiting for the kernel lock, so that it can be
+    // taken out of the waiters until the context is unwound.  An API waiter is never put
+    // in the dispatch queue: it has priority and goes straight for the kernel lock, so
+    // waitingAccess and waitingApiAccess count it while the queue does not hold it.
+    // See bug #2073.
     waitingAct->setWaitingForDispatch();
 
     // if we have a lock holder currently, ask the RexxActivation to yield immediately.
@@ -290,7 +347,7 @@ void ActivityManager::addWaitingApiActivity(Activity *waitingAct)
 
     // now that we have the kernel lock, dispatch another waiter
     // to make sure the pipeline is always active.
-    dispatchNext();
+    dispatchNext(lock);
 
     // the setting of the sentinel variables acts as a memory barrier to
     // ensure that the assignment of currentActivitiy occurs precisely at this point.
@@ -301,23 +358,25 @@ void ActivityManager::addWaitingApiActivity(Activity *waitingAct)
 
 /**
  * Find an activity in the queue that is waiting for run permission
- * and free it up for execution. Elements in the waitingActivities
+ * and free it up for execution. Elements in the dispatch
  * queue can be in different places in the dispatch process and we
  * don't want to get things held up because an activity might not
  * be able to obtain the lock immediately.
  *
+ * @param lock   The dispatch section held by the caller.  Passing this proves
+ *               the queue lock is held for the duration of the scan.
+ *
  * @return true if an item was dispatched, false if nothing was dispatched.
  */
-bool ActivityManager::dispatchNext()
+bool ActivityManager::dispatchNext(DispatchSection &lock)
 {
     // run the dispatch queue looking for a non-posted activity and
     // remove any that have already been posted.
-    while (!waitingActivities.empty())
+    while (!lock.isEmpty())
     {
         // look for the first activity that has not had its semaphore posted yet and post it.
-        Activity *activity = waitingActivities.front();
         // we're going to remove this in either case, so pop it off now.
-        waitingActivities.pop_front();
+        Activity *activity = lock.removeFirst();
 
         // if this has not been posted yet, post now and return.
         // there are some situations where a NULL ends up in the queue, so
@@ -411,11 +470,11 @@ void ActivityManager::shutdown()
  *
  * @return The newly created activation.
  */
-RexxActivation *ActivityManager::newActivation(Activity *activity, RoutineClass *routine, RexxCode *code, RexxString *calltype, RexxString *environment, ActivationContext context)
+RexxActivation *ActivityManager::newActivation(Activity *activity, RexxActivation *parent, RoutineClass *routine, RexxCode *code, RexxString *calltype, RexxString *environment, ActivationContext context)
 {
     // in heavily multithreaded environments, the activation cache is a source for race conditions
     // that can lead to crashes.  Just unconditionally create a new actvation
-    return new RexxActivation(activity, routine, code, calltype, environment, context);
+    return new RexxActivation(activity, parent, routine, code, calltype, environment, context);
 }
 
 
@@ -449,11 +508,11 @@ RexxActivation *ActivityManager::newActivation(Activity *activity, RexxActivatio
  *
  * @return The newly created activation.
  */
-RexxActivation *ActivityManager::newActivation(Activity *activity, MethodClass *method, RexxCode *code)
+RexxActivation *ActivityManager::newActivation(Activity *activity, RexxActivation *parent, MethodClass *method, RexxCode *code)
 {
     // in heavily multithreaded environments, the activation cache is a source for race conditions
     // that can lead to crashes.  Just unconditionally create a new actvation
-    return new RexxActivation(activity, method, code);
+    return new RexxActivation(activity, parent, method, code);
 }
 
 
@@ -511,7 +570,7 @@ Activity* ActivityManager::createNewActivity()
         activity = new Activity(p, true);
         lock.reacquire();
         // add this to our table of all activities
-        allActivities->append(activity);
+        allActivities().append(activity);
     }
     else
     {
@@ -539,7 +598,7 @@ Activity *ActivityManager::createCurrentActivity()
     // we need the resource lock while doing this.
     ResourceSection lock;
     // add this to the activity table and return
-    allActivities->append(activity);
+    allActivities().append(activity);
     return activity;
 }
 
@@ -568,6 +627,8 @@ Activity *ActivityManager::createNewActivity(Activity *parent)
  */
 void ActivityManager::clearActivityPool()
 {
+    ResourceSection lock;                // critical section, protect interaction with activity queues
+
     Activity *activity = (Activity *)availableActivities->pull();
     while (activity != OREF_NULL)
     {
@@ -591,14 +652,17 @@ void ActivityManager::clearActivityPool()
  */
 bool ActivityManager::poolActivity(Activity *activity)
 {
+    // ResourceSection lock held by caller: bool InterpreterInstance::poolActivity(Activity *activity
+
     // are we shutting down or have too many threads in the pool?
     if (processTerminating || availableActivities->items() > MAX_THREAD_POOL_SIZE)
     {
-        // have the activity clean up its resources.
-        activity->cleanupActivityResources();
-
-        // remove this from the activity list
-        allActivities->removeItem(activity);
+        // The thread will end: Activity::runThread() calls activityEnded(),
+        // which removes the activity from allActivities() and cleans it up.
+        // Do not remove it here: allActivities() is what keeps the activity
+        // alive, and runThread() releases the kernel lock and then uses the
+        // activity again (in activityEnded()) while holding no lock at all, so a
+        // garbage collection on another thread in between would sweep it.
         return false;
     }
     else
@@ -685,9 +749,9 @@ Activity *ActivityManager::findActivity(thread_id_t threadId)
     // NB:  New activities are pushed on to the end, so it's prudent to search
     // from the list end toward the front of the list.  Also, this ensures we
     // will find the toplevel activity nested on a given thread first.
-    for (size_t listIndex = allActivities->lastIndex(); listIndex > 0; listIndex--)
+    for (size_t listIndex = allActivities().lastIndex(); listIndex > 0; listIndex--)
     {
-        Activity *activity = (Activity *)allActivities->get(listIndex);
+        Activity *activity = (Activity *)allActivities().get(listIndex);
         // this should never happen, but we never return suspended threads
         if (activity->isThread(threadId) && !activity->isSuspended())
         {
@@ -723,13 +787,16 @@ void ActivityManager::exit(int retcode)
 /**
  * release the kernel access and make sure waiting activites are woken up.
  */
-void ActivityManager::releaseAccess()
+void ActivityManager::releaseAccess(bool dispatch)
 {
     DispatchSection lock;                // need the dispatch queue lock
 
     // since we're releasing the semaphore, give any queued activities a nudge
     // forward in the request process.
-    dispatchNext();
+    if (dispatch)
+    {
+        dispatchNext(lock);
+    }
 
     // now release the kernel lock
     unlockKernel();
@@ -741,10 +808,12 @@ void ActivityManager::releaseAccess()
  */
 void ActivityManager::createLocks()
 {
-    kernelSemaphore.create();
+    kernelLock().create();
+    // the lock guarding the dispatch queue
+    WaitingActivityQueue::createLock();
     // this needs to be created and set
-    terminationSem.create();
-    terminationSem.reset();
+    terminationLock().create();
+    terminationLock().reset();
 }
 
 
@@ -753,8 +822,9 @@ void ActivityManager::createLocks()
  */
 void ActivityManager::closeLocks()
 {
-    kernelSemaphore.close();
-    terminationSem.close();
+    WaitingActivityQueue::closeLock();
+    kernelLock().close();
+    terminationLock().close();
 }
 
 
@@ -772,7 +842,7 @@ bool ActivityManager::lockKernelImmediate()
     // dispatch queue
     if (!hasWaiters())
     {
-        return kernelSemaphore.requestImmediate();
+        return kernelLock().requestImmediate();
     }
     return false;
 }
@@ -790,7 +860,7 @@ void ActivityManager::returnActivity(Activity *activityObject)
     {
         ResourceSection lock;
         // remove this from the activte list
-        allActivities->removeItem(activityObject);
+        allActivities().removeItem(activityObject);
         // if we ended up pushing an old activity down when we attached this
         // thread, then we need to restore the old thread to active state.
         Activity *oldActivity = activityObject->getNestedActivity();
@@ -832,13 +902,13 @@ void ActivityManager::activityEnded(Activity *activityObject)
     {
         ResourceSection lock;       // this is a critical section
         // and also remove from the global list
-        allActivities->removeItem(activityObject);
+        allActivities().removeItem(activityObject);
         // cleanup any system resources this activity might own
         activityObject->cleanupActivityResources();
 
         // did we just release the last activity during a shutdown?  The shutdown
         // can now complete.
-        if (processTerminating && allActivities->isEmpty())
+        if (processTerminating && allActivities().isEmpty())
         {
             // notify any waiters that we're clear
             postTermination();
@@ -899,7 +969,7 @@ void ActivityManager::returnRootActivity(Activity *activity)
     ResourceSection lock;                // need the control block locks
     // remove this from the activity list so it will never get
     // picked up again.
-    allActivities->removeItem(activity);
+    allActivities().removeItem(activity);
 }
 
 
@@ -1017,67 +1087,30 @@ void ActivityManager::suspendDispatch(Activity *activity)
         waitingApiAccess--;
     }
 
-    if (!waitingActivities.empty())
+    // if this activity is at the front of the queue, then we need to remove
+    // this and dispatch the new front element.
+    if (lock.peekFirst() == activity)
     {
-
-        // if this activity is at the front of the queue, then we need to remove
-        // this and dispatch the new front element.
-        if (waitingActivities.front() == activity)
-        {
-            // We can generally only get here if the activity is waiting on either the
-            // run semaphore or the kernel semaphore already. This will not wake up again
-            // until the current activity stack unwinds to the semaphore call, so
-            // we remove this from the queue so it doesn't keep getting dispatched and
-            // them poke the next activity in line if there is one. This will get
-            // returned to the queue once the re-entry is complete.
-            waitingActivities.pop_front();
-            // If we have another activity in the queue, dispatch it now.
-            dispatchNext();
-        }
-        // we're in line behind some other activity, so just remove this one
-        // from the queue. We don't need to repost anything at this point.
-        else
-        {
-            removeWaitingActivity(activity);
-        }
+        // We can generally only get here if the activity is waiting on either the
+        // run semaphore or the kernel semaphore already. This will not wake up again
+        // until the current activity stack unwinds to the semaphore call, so
+        // we remove this from the queue so it doesn't keep getting dispatched and
+        // them poke the next activity in line if there is one. This will get
+        // returned to the queue once the re-entry is complete.
+        lock.removeFirst();
+        // If we have another activity in the queue, dispatch it now.
+        dispatchNext(lock);
     }
-}
-
-
-/**
- * In certain situations (mostly confined to Windows),
- * we can re-enter the interpreter on a thread that is
- * currently on the dispatch queue. If that activity gets
- * dispatched, then everything blocks because the
- * activity never wakes up until the nested thread returns.
- * In that situation, we need to ensure that the original
- * waiting activity is removed from the dispatch queue
- * until it is the top activity on the stack.
- *
- * @param waitingAct The activity to remove from the queue.
- */
-void ActivityManager::removeWaitingActivity(Activity *waitingAct)
-{
-    // NOTE: The caller must be holding the dispatch lock
-
-    // iterators don't work if the collection is empty, so
-    // this can occur if the run semaphore has already been posted.
-    if (waitingActivities.empty())
+    // we're in line behind some other activity, so just remove this one
+    // from the queue. We don't need to repost anything at this point.
+    // In certain situations (mostly confined to Windows), we can re-enter the
+    // interpreter on a thread that is currently on the dispatch queue. If that
+    // activity gets dispatched, then everything blocks because the activity never
+    // wakes up until the nested thread returns.  Not being queued is not an error.
+    else
     {
-        return;
+        lock.remove(activity);
     }
-
-    // search for the activity position and remove it.
-    for (std::deque<Activity *>::iterator it = waitingActivities.begin(); it != waitingActivities.end(); ++it)
-    {
-        // if this is found, remove it from the queue
-        if (*it == waitingAct)
-        {
-            waitingActivities.erase(it);
-            return;
-        }
-    }
-    // ignore this if not found.
 }
 
 
@@ -1119,7 +1152,7 @@ RexxObject *ActivityManager::getLocalEnvironment(RexxString *name)
     {
         return TheNilObject;
     }
-    return currentActivity->getLocalEnvironment(name);
+    return currentActivity.load()->getLocalEnvironment(name);
 }
 
 
@@ -1134,7 +1167,7 @@ DirectoryClass *ActivityManager::getLocal()
     {
         return OREF_NULL;
     }
-    return currentActivity->getLocal();
+    return currentActivity.load()->getLocal();
 }
 
 

@@ -73,10 +73,9 @@
 
 #include "SysFile.hpp"
 
-// This is all the static stuff
-const int SysFile::stdinHandle = 0;
-const int SysFile::stdoutHandle = 1;
-const int SysFile::stderrHandle = 2;
+// NOTE: stdinHandle/stdoutHandle/stderrHandle are now initialised in-class in
+// SysFile.hpp.  Defining them here emitted one copy per shared library that
+// compiles this file (librexx and librexxapi), which is an ODR violation.
 
 /**
  * Default constructor for a SysFile object.
@@ -1216,8 +1215,8 @@ void SysFile::getStreamTypeInfo()
         {
             readable = true;
         }
-        // tagged as FIFO, then this is also a transient
-        if ((fileInfo.st_mode & S_IFIFO) != 0)
+        // a FIFO or a socket is also a transient
+        if (S_ISFIFO(fileInfo.st_mode) || S_ISSOCK(fileInfo.st_mode))
         {
             transient = true;
         }

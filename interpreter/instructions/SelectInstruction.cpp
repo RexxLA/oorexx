@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2023 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -141,6 +141,8 @@ void RexxInstructionSelect::execute(RexxActivation *context, ExpressionStack *st
     // if we've been asked to re-execute.
     if (context->conditionalPauseInstruction())
     {
+        // executed again: the FINALLY clause does not run
+        doblock->setFinally(OREF_NULL);
         this->terminate(context, doblock);
     }
 }
@@ -165,6 +167,11 @@ bool RexxInstructionSelect::isLoop()
  */
 void RexxInstructionSelect::terminate(RexxActivation *context, DoBlock *doblock )
 {
+    // the code of a FINALLY clause runs first; the SELECT ends at its END
+    if (context->enterFinally(doblock))
+    {
+        return;
+    }
     // we terminate this doblock
     context->terminateBlockInstruction(doblock->getIndent());
     // and we jump to the instruction after our END
@@ -364,15 +371,32 @@ void RexxInstructionSelectCase::execute(RexxActivation *context, ExpressionStack
 
     // create an active DO block, which marks that we have an active SELECT
     // in case someone tries do SIGNAL into the middle of the instruction.
-    DoBlock *doblock = new DoBlock (context, this);
+    // protect it, as the expression evaluation may trigger a GC
+    Protected<DoBlock> doblock = new DoBlock (context, this);
+
+    // a SELECT CASE with CATCH clauses is active while the CASE expression
+    // is evaluated, as a loop is while its clause is (RFE #31)
+    bool catching = doblock->getCatches() != OREF_NULL;
+    if (catching)
+    {
+        context->newBlockInstruction(doblock);
+        context->unindent();
+    }
 
     // evaluate the CASE instruction and store in the doblock so the WHEN
     // instructions can retrieve it.
-    RexxObject *caseResult = caseExpr->evaluate(context, stack);
+    ProtectedObject caseResult = caseExpr->evaluate(context, stack);
     context->traceKeywordResult(GlobalNames::CASE, caseResult);
 
     // set the block to the top of the context stack.
-    context->newBlockInstruction(doblock);
+    if (catching)
+    {
+        context->indent();
+    }
+    else
+    {
+        context->newBlockInstruction(doblock);
+    }
 
     doblock->setCase(caseResult);
 
@@ -380,6 +404,8 @@ void RexxInstructionSelectCase::execute(RexxActivation *context, ExpressionStack
     // if we've been asked to re-execute.
     if (context->conditionalPauseInstruction())
     {
+        // executed again: the FINALLY clause does not run
+        doblock->setFinally(OREF_NULL);
         terminate(context, doblock);
     }
 }

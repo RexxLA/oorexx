@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -107,6 +107,8 @@
 #include "DoInstruction.hpp"
 #include "EndInstruction.hpp"
 #include "OtherwiseInstruction.hpp"
+#include "CatchInstruction.hpp"
+#include "FinallyInstruction.hpp"
 #include "SelectInstruction.hpp"
 #include "ProtectedObject.hpp"
 #include "UseArgVariableRef.hpp"
@@ -290,7 +292,12 @@ RexxInstruction* LanguageParser::nextInstruction()
 
                 // RAISE instruction
             case KEYWORD_RAISE:
-                return raiseNew();
+                return raiseNew(false);
+                break;
+
+                // THROW instruction (RFE #31)
+            case KEYWORD_THROW:
+                return raiseNew(true);
                 break;
 
                 // ADDRESS instruction
@@ -430,6 +437,16 @@ RexxInstruction* LanguageParser::nextInstruction()
                 // OTEHRWISE in a SELECT
             case KEYWORD_OTHERWISE:
                 return otherwiseNew(first);
+                break;
+
+                // CATCH clause of a DO, LOOP or SELECT (RFE #31)
+            case KEYWORD_CATCH:
+                return catchNew();
+                break;
+
+                // FINALLY clause of a DO, LOOP or SELECT (RFE #31)
+            case KEYWORD_FINALLY:
+                return finallyNew(first);
                 break;
 
                 // ELSE instruction...possibly unexpected.
@@ -1228,6 +1245,11 @@ RexxInstruction* LanguageParser::callNew()
     if (!noInternal)
     {
         addReference(newObject);
+    }
+    // a literal name always calls the builtin, if there is one
+    else
+    {
+        requireBuiltinLanguageLevel(builtin_index, argCount);
     }
     return newObject;
 }
@@ -2301,6 +2323,8 @@ RexxInstruction *LanguageParser::exitNew()
     // this is pretty simple...parse the optional expression and create the
     // instruction instance.
     RexxInternalObject *expression = parseExpression(TERM_EOC);
+    // an EXIT must not leave a FINALLY clause
+    checkFinallyExit("EXIT");
     RexxInstruction *newObject = new_instruction(EXIT, Exit);
     ::new ((void *)newObject) RexxInstructionExit(expression);
     return newObject;
@@ -2563,6 +2587,17 @@ RexxInstruction *LanguageParser::forwardNew()
         }
         // go process another keyword
         token = nextReal();
+    }
+    // a FORWARD ends the method, as a RETURN does (unless it is a FORWARD
+    // CONTINUE): it must not leave a FINALLY clause
+    if (!returnContinue)
+    {
+        checkFinallyExit("FORWARD");
+        // nor be in a block that has one: the method would have to go on,
+        // to run the clause, and a FORWARD ends it at once.  The FINALLY
+        // clause comes later, so it is the one that checks
+        lastForward = clauseLocation;
+        hasForward = true;
     }
     // and create the forward object
     RexxInstruction *newObject = new_instruction(FORWARD, Forward);
@@ -2838,6 +2873,9 @@ RexxInstruction *LanguageParser::leaveNew(InstructionKeyword type)
         requiredEndOfClause(type == KEYWORD_LEAVE ? Error_Invalid_data_leave : Error_Invalid_data_iterate);
     }
 
+    // a LEAVE or ITERATE must not leave a FINALLY clause
+    checkFinallyExit(type == KEYWORD_LEAVE ? "LEAVE" : "ITERATE", true, name);
+
     // allocate the object and return
     RexxInstruction *newObject = type == KEYWORD_LEAVE ? new_instruction(LEAVE, Leave) : new_instruction(ITERATE, Leave);
     ::new ((void *)newObject) RexxInstructionLeave(name);
@@ -3074,6 +3112,227 @@ RexxInstruction *LanguageParser::optionsNew()
     RexxInstruction *newObject = new_instruction(OPTIONS, Options);
     ::new ((void *)newObject) RexxInstructionOptions(expression);
     return newObject;
+}
+
+
+/**
+ * Parse a CATCH clause of a DO, LOOP or SELECT (RFE #31):
+ * CATCH [variable =] condition [, condition]...
+ * The variable gets the condition object when the clause runs.
+ * As on RAISE, SYNTAX can be followed by an error number, and ERROR
+ * and FAILURE by a return code; here they are constants (a literal
+ * string or a constant symbol, with an optional sign).
+ *
+ * @return An executable CATCH instruction object.
+ */
+RexxInstruction *LanguageParser::catchNew()
+{
+    // CATCH is new in 5.3.0: a program that uses it has a new instruction
+    // class and a new END style in its image, so an earlier interpreter
+    // must reject it when it is loaded from a compiled file
+    requireLanguageLevel(LanguageLevel0607);
+
+    // an optional variable for the condition object, as in NetRexx's
+    // CATCH [variable =] exception
+    RexxVariableBase *variable = OREF_NULL;
+    size_t start = markPosition();
+    RexxToken *first = nextReal();
+    RexxToken *second = first->isSymbol() ? nextReal() : OREF_NULL;
+    if (second != OREF_NULL && second->isOperator(OPERATOR_EQUAL))
+    {
+        if (first->isSubtype(SYMBOL_CONSTANT))
+        {
+            syntaxError(Error_Invalid_variable_number, first);
+        }
+        else if (first->isSubtype(SYMBOL_DUMMY, SYMBOL_DOTSYMBOL))
+        {
+            syntaxError(Error_Invalid_variable_period, first);
+        }
+        variable = addVariable(first);
+    }
+    else
+    {
+        // no variable: the conditions start at the first token
+        resetPosition(start);
+    }
+    ProtectedObject pVariable(variable);
+
+    // a list of conditions, separated by commas
+    Protected<ArrayClass> conditions = new_array();
+    // the code of each condition, or .nil
+    Protected<ArrayClass> codes = new_array();
+    bool hasCodes = false;
+    for (;;)
+    {
+        RexxToken *token = nextReal();
+        if (!token->isSymbol())
+        {
+            syntaxError(Error_Symbol_expected_catch);
+        }
+        RexxString *conditionName;
+        ConditionKeyword condType = token->condition();
+        if (condType == CONDITION_NONE || condType == CONDITION_PROPAGATE)
+        {
+            syntaxError(Error_Invalid_subkeyword_catch, token);
+        }
+        // USER conditions are "USER name", as for SIGNAL ON
+        else if (condType == CONDITION_USER)
+        {
+            token = nextReal();
+            if (!token->isSymbol())
+            {
+                syntaxError(Error_Symbol_expected_user);
+            }
+            conditionName = commonString(token->value()->concatToCstring("USER "));
+        }
+        else
+        {
+            conditionName = token->value();
+        }
+        conditions->append(conditionName);
+
+        token = nextReal();
+        RexxObject *code = TheNilObject;
+        // SYNTAX number, ERROR errorcode, FAILURE failurecode
+        if ((condType == CONDITION_SYNTAX || condType == CONDITION_ERROR || condType == CONDITION_FAILURE) &&
+            !token->isEndOfClause() && !token->isComma())
+        {
+            if (condType == CONDITION_SYNTAX)
+            {
+                // a simple variable is read when the clause is tested
+                if (token->isSymbol() && token->isSubtype(SYMBOL_VARIABLE))
+                {
+                    code = (RexxObject *)addVariable(token);
+                }
+                else
+                {
+                    // a number or a literal string: checked now, and kept as
+                    // major * 1000 + minor
+                    if (!token->isLiteral() && !(token->isSymbol() && token->isSubtype(SYMBOL_CONSTANT)))
+                    {
+                        // a stem, a compound variable, an environment symbol,
+                        // or not a symbol
+                        syntaxError(Error_Invalid_expression_general, token);
+                    }
+                    wholenumber_t number = RexxInstructionCatch::errorNumber(token->value());
+                    if (number < 0)
+                    {
+                        syntaxError(Error_Invalid_expression_catch_syntax, token);
+                    }
+                    code = new_integer(number);
+                }
+            }
+            // ERROR and FAILURE: a number, optionally signed (as on
+            // ::CONSTANT), a literal string, or a simple variable, which is
+            // read when the clause is tested.  Nothing is evaluated.
+            else if (token->isOperator(OPERATOR_SUBTRACT) || token->isOperator(OPERATOR_PLUS))
+            {
+                bool negative = token->isOperator(OPERATOR_SUBTRACT);
+                token = nextToken();
+                if (!token->isSymbol() || !token->isSubtype(SYMBOL_CONSTANT) || token->value()->numberString() == OREF_NULL)
+                {
+                    syntaxError(Error_Invalid_expression_general, token);
+                }
+                code = negative ? token->value()->concatToCstring("-") : token->value();
+            }
+            else if (token->isLiteral())
+            {
+                code = token->value();
+            }
+            else if (token->isSymbol() && token->isSubtype(SYMBOL_CONSTANT) && token->value()->numberString() != OREF_NULL)
+            {
+                code = token->value();
+            }
+            else if (token->isSymbol() && token->isSubtype(SYMBOL_VARIABLE))
+            {
+                code = (RexxObject *)addVariable(token);
+            }
+            else
+            {
+                // a stem, a compound variable, an environment symbol, a
+                // constant symbol that is not a number, or not a symbol
+                syntaxError(Error_Invalid_expression_general, token);
+            }
+            hasCodes = true;
+            token = nextReal();
+        }
+        codes->append(code);
+
+        if (token->isEndOfClause())
+        {
+            break;
+        }
+        if (!token->isComma())
+        {
+            syntaxError(Error_Invalid_data_condition, token);
+        }
+    }
+
+    RexxInstruction *newObject = new_instruction(CATCH, Catch);
+    ::new ((void *)newObject) RexxInstructionCatch(conditions, variable, hasCodes ? (ArrayClass *)codes : OREF_NULL);
+    return newObject;
+}
+
+
+/**
+ * Parse a FINALLY clause of a DO, LOOP or SELECT (RFE #31).
+ * As THEN, ELSE and OTHERWISE do, the keyword implies a semicolon
+ * after it: an instruction may follow on the same line.  It is
+ * split off in translateBlock().
+ *
+ * @param token  The FINALLY keyword token.
+ *
+ * @return An executable FINALLY instruction object.
+ */
+RexxInstruction *LanguageParser::finallyNew(RexxToken *token)
+{
+    // FINALLY is new in 5.3.0: a program that uses it has a new instruction
+    // class in its image, so an earlier interpreter must reject it when it
+    // is loaded from a compiled file
+    requireLanguageLevel(LanguageLevel0607);
+
+    RexxInstruction *newObject = new_instruction(FINALLY, Finally);
+    ::new ((void *)newObject) RexxInstructionFinally(token);
+    return newObject;
+}
+
+
+/**
+ * The rule of FINALLY: a FINALLY clause can only end by reaching
+ * its end, or by raising a condition.  An instruction that takes
+ * control somewhere else must not be in the code of a FINALLY clause,
+ * unless it stays inside that code (a LEAVE or ITERATE of a block
+ * that is itself in the clause).  What cannot be seen here (INTERPRET,
+ * an EXIT in an internal routine called from the clause) is checked
+ * at run time by RexxActivation::checkFinallyExit() (RFE #31).
+ *
+ * @param keyword     The instruction, for the error message.
+ * @param blockTarget true for LEAVE and ITERATE, which only leave the
+ *                    blocks down to their target.
+ * @param name        The block name given on the LEAVE or ITERATE,
+ *                    if any.
+ */
+void LanguageParser::checkFinallyExit(const char *keyword, bool blockTarget, RexxString *name)
+{
+    // the control stack, from the innermost pending instruction outwards
+    for (size_t i = 1; i <= control->lastIndex(); i++)
+    {
+        RexxInstruction *inst = (RexxInstruction *)control->get(i);
+        // we are in the code of this FINALLY clause, and going out of it
+        if (inst->isType(KEYWORD_FINALLY))
+        {
+            syntaxError(Error_Translation_finally_exit, new_string(keyword), new_integer(inst->getLineNumber()));
+        }
+        // the target of a LEAVE or ITERATE: it is inside the clause
+        if (blockTarget && inst->isControl())
+        {
+            RexxBlockInstruction *block = (RexxBlockInstruction *)inst;
+            if (name == OREF_NULL ? block->isLoop() : block->isLabel(name))
+            {
+                return;
+            }
+        }
+    }
 }
 
 
@@ -3505,11 +3764,15 @@ RexxInstruction *LanguageParser::pushNew()
 
 
 /**
- * Parse a RAISE instruction and return a new executable object.
+ * Parse a RAISE or THROW instruction and return a new executable
+ * object.  THROW (RFE #31) has the form of RAISE without the RETURN
+ * and EXIT options.
  *
- * @return An instructon object that can execute this RAISE instruction.
+ * @param isThrow true for THROW, false for RAISE.
+ *
+ * @return An instructon object that can execute this instruction.
  */
-RexxInstruction *LanguageParser::raiseNew()
+RexxInstruction *LanguageParser::raiseNew(bool isThrow)
 {
     ArrayClass *arrayItems = OREF_NULL;
     RexxInternalObject *rcValue = OREF_NULL;
@@ -3518,12 +3781,19 @@ RexxInstruction *LanguageParser::raiseNew()
     RexxInternalObject *result = OREF_NULL;
     FlagSet<RaiseInstructionFlags, 32> flags;
 
+    // THROW is new in 5.3.0
+    if (isThrow)
+    {
+        requireLanguageLevel(LanguageLevel0607);
+        flags[raise_throw] = true;
+    }
+
     // ok, get the first TOKEN
     RexxToken *token = nextReal();
     // the first token is the condition name, and must be a symbol
     if (!token->isSymbol())
     {
-        syntaxError(Error_Symbol_expected_raise);
+        syntaxError(isThrow ? Error_Symbol_expected_throw : Error_Symbol_expected_raise);
     }
 
     RexxString *_condition = token->value();
@@ -3592,7 +3862,7 @@ RexxInstruction *LanguageParser::raiseNew()
 
         // could be ALL, or could be something completely unknown.
         default:
-            syntaxError(Error_Invalid_subkeyword_raise, token);
+            syntaxError(isThrow ? Error_Invalid_subkeyword_throw : Error_Invalid_subkeyword_raise, token);
             break;
     }
 
@@ -3605,11 +3875,17 @@ RexxInstruction *LanguageParser::raiseNew()
         // all options are symbol names,
         if (!token->isSymbol())
         {
-            syntaxError(Error_Invalid_subkeyword_raiseoption, token);
+            syntaxError(isThrow ? Error_Invalid_subkeyword_throwoption : Error_Invalid_subkeyword_raiseoption, token);
         }
 
         // map the keyword name to a symbolic identifier.
         InstructionSubKeyword option = token->subKeyword();
+        // a thrown condition ends every level it leaves, and none of them
+        // returns anything: THROW has no RETURN and no EXIT
+        if (isThrow && (option == SUBKEY_RETURN || option == SUBKEY_EXIT))
+        {
+            syntaxError(Error_Invalid_subkeyword_throwoption, token);
+        }
         switch (option)
         {
             // RAISE .... DESCRIPTION expr
@@ -3624,7 +3900,7 @@ RexxInstruction *LanguageParser::raiseNew()
                 description = parseConstantExpression();
                 if (description == OREF_NULL)
                 {
-                    syntaxError(Error_Invalid_expression_raise_description);
+                    syntaxError(isThrow ? Error_Invalid_expression_throw_description : Error_Invalid_expression_raise_description);
                 }
                 // protect from GC.
                 pushSubTerm(description);
@@ -3643,7 +3919,7 @@ RexxInstruction *LanguageParser::raiseNew()
                 additional = parseConstantExpression();
                 if (additional == OREF_NULL)
                 {
-                    syntaxError(Error_Invalid_expression_raise_additional);
+                    syntaxError(isThrow ? Error_Invalid_expression_throw_additional : Error_Invalid_expression_raise_additional);
                 }
                 pushSubTerm(additional);
                 break;
@@ -3686,6 +3962,9 @@ RexxInstruction *LanguageParser::raiseNew()
                 {
                     syntaxError(Error_Invalid_subkeyword_result);
                 }
+                // RETURN and EXIT give the routine a result of their own: they
+                // would replace what is pending in a FINALLY clause
+                checkFinallyExit("RAISE");
                 // remember which return type we need to use
                 flags[raise_return] = true;
                 // and get the return value
@@ -3706,6 +3985,7 @@ RexxInstruction *LanguageParser::raiseNew()
                 {
                     syntaxError(Error_Invalid_subkeyword_result);
                 }
+                checkFinallyExit("RAISE");
                 flags[raise_exit] = true;
                 // get the optional keyword value
                 result = parseConstantExpression();
@@ -3718,7 +3998,7 @@ RexxInstruction *LanguageParser::raiseNew()
 
             // and invalid subkeyword
             default:
-                syntaxError(Error_Invalid_subkeyword_raiseoption, token);
+                syntaxError(isThrow ? Error_Invalid_subkeyword_throwoption : Error_Invalid_subkeyword_raiseoption, token);
                 break;
         }
         token = nextReal();                /* step to the next keyword          */
@@ -3732,12 +4012,13 @@ RexxInstruction *LanguageParser::raiseNew()
         size_t arrayCount = arrayItems->size();
         // we pass this as the additional...the flag tells us which to use
         additional = arrayItems;
-        newObject = new_variable_instruction(RAISE, Raise, arrayCount, RexxObject *);
+        newObject = isThrow ? new_variable_instruction(THROW, Raise, arrayCount, RexxObject *)
+                            : new_variable_instruction(RAISE, Raise, arrayCount, RexxObject *);
     }
     // fixed instruction size
     else
     {
-        newObject = new_instruction(RAISE, Raise);
+        newObject = isThrow ? new_instruction(THROW, Raise) : new_instruction(RAISE, Raise);
     }
     ::new ((void *)newObject) RexxInstructionRaise(_condition, rcValue, description, additional, result, flags);
     return newObject;
@@ -3760,6 +4041,9 @@ RexxInstruction *LanguageParser::replyNew()
     // this is pretty simple...parse the optional expression and create the
     // instruction instance.
     RexxInternalObject *expression = parseExpression(TERM_EOC);
+    // a REPLY returns a result to the caller: in a FINALLY clause it would
+    // replace what is pending
+    checkFinallyExit("REPLY");
 
     RexxInstruction *newObject = new_instruction(REPLY, Reply);
     ::new ((void *)newObject) RexxInstructionReply(expression);
@@ -3777,6 +4061,8 @@ RexxInstruction *LanguageParser::returnNew()
     // this is pretty simple...parse the optional expression and create the
     // instruction instance.
     RexxInternalObject *expression = parseExpression(TERM_EOC);
+    // a RETURN must not leave a FINALLY clause
+    checkFinallyExit("RETURN");
 
     RexxInstruction *newObject = new_instruction(RETURN, Return);
     ::new ((void *)newObject) RexxInstructionReturn(expression);
@@ -3901,6 +4187,9 @@ RexxInstruction *LanguageParser::dynamicSignalNew()
     // we are already positioned for processing the label expression, so
     // parse it off now.
     RexxInternalObject *labelExpression = requiredExpression(TERM_EOC, Error_Invalid_expression_signal);
+
+    // a SIGNAL must not leave a FINALLY clause
+    checkFinallyExit("SIGNAL");
 
     // create a new instruction object
     RexxInstruction *newObject = new_instruction(SIGNAL_VALUE, DynamicSignal);
@@ -4088,6 +4377,9 @@ RexxInstruction *LanguageParser::signalNew()
             requiredEndOfClause(Error_Invalid_data_signal);
         }
     }
+
+    // a SIGNAL must not leave a FINALLY clause
+    checkFinallyExit("SIGNAL");
 
     // create a new instruction object
     RexxInstruction *newObject = new_instruction(SIGNAL, Signal);
@@ -4446,7 +4738,7 @@ RexxInstruction *LanguageParser::useNew()
             else
             {
                 // if not an assignment, this needs to be a comma.
-                syntaxError(Error_Variable_reference_use, token);
+                syntaxError(Error_Variable_reference_use_default, token);
             }
         }
     }

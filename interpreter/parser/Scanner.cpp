@@ -46,6 +46,7 @@
 #include "ArrayClass.hpp"
 #include "LanguageParser.hpp"
 #include "GlobalNames.hpp"
+#include "Unicode/utf8proc/utf8proc.h"
 
 #include <stdio.h>
 #include <ctype.h>
@@ -1162,17 +1163,48 @@ RexxToken *LanguageParser::sourceNextToken(RexxToken *previous )
                     // invalid character of some type
                     default:
                     {
-                        char   badchar[4];                    // working buffers for the errors
-                        char   hexbadchar[4];
+                        // The default byte encoding is 1 byte.
+                        // UTF-8 is 1..4 bytes.
+                        char   badchar[4 + 1];                    // working buffers for the errors
+                        char   hexbadchar[4*2 + 1];
 
-                        // mark current position n in clause */
-                        clause->setEnd(lineNumber, lineOffset);
-                        // update the error information
-                        clauseLocation = clause->getLocation();
                         snprintf(badchar, sizeof(badchar), "%c", inch);
                         snprintf(hexbadchar, sizeof(hexbadchar), "%2.2X", inch);
+
+                        // Example:
+                        // current == "say a ¬= 1"
+                        // currentLength == 11
+                        // inch == '\xC2'
+                        // lineOffset == 7 (inch position + 1)
+                        // s  a  y     a     ¬    =     1
+                        // 73 61 79 20 61 20 C2AC 3D 20 31
+                        // 0  1  2  3  4  5  6 7  8  9  10
+                        const unsigned char *bytes = (const unsigned char *)current + lineOffset - 1; // inch == bytes[0]
+                        size_t remainingBytesCount = currentLength - lineOffset + 1;
+                        utf8proc_int32_t codepoint;
+                        utf8proc_ssize_t bytesCount = utf8proc_iterate(bytes, remainingBytesCount, &codepoint);
+                        if (bytesCount >= 1 && bytesCount <= 4)
+                        {
+                            // Valid UTF-8 byte sequence consisting of 1 to 4 bytes
+                            snprintf(badchar, bytesCount + 1, "%s", bytes);
+                            int offset = 0;
+                            for (int i = 0; i < bytesCount; i++)
+                            {
+                                offset += snprintf(hexbadchar + offset, sizeof(hexbadchar) - offset, "%2.2X", bytes[i]);
+                            }
+                        }
+
+                        // mark current position n in clause */
+                        size_t clauseEnd = lineOffset;
+                        if (bytesCount >= 2) clauseEnd += bytesCount - 1;
+                        clause->setEnd(lineNumber, clauseEnd);
+                        // update the error information
+                        clauseLocation = clause->getLocation();
+
                         // report the error with the invalid character displayed normally and in hex.
-                        syntaxError(Error_Invalid_character_char, new_string(badchar), new_string(hexbadchar));
+                        Protected<RexxString> badcharString = new_string(badchar);
+                        Protected<RexxString> hexbadcharString = new_string(hexbadchar);
+                        syntaxError(Error_Invalid_character_char, badcharString, hexbadcharString);
                         break;
                     }
                 }
@@ -1329,7 +1361,14 @@ RexxToken *LanguageParser::scanSymbol()
                 {
                     state = EXP_EDIGIT;
                 }
-                // we handle the sign situation below.
+                // any other symbol character means this cannot be a
+                // number, and a sign after it ends the symbol.  The sign
+                // itself is not a symbol character, so it never reaches
+                // this switch: we handle the sign situation below.
+                else
+                {
+                    state = EXP_EXCLUDED;
+                }
                 break;
             }
 
@@ -1771,8 +1810,6 @@ StringSymbolType LanguageParser::scanSymbol(RexxString *string)
 
     // counter of periods in the name
     size_t compound = 0;
-    // no exponent encountered
-    bool haveExponent = false;
 
     const char *scan = string->getStringData();
 
@@ -1808,11 +1845,14 @@ StringSymbolType LanguageParser::scanSymbol(RexxString *string)
             return STRING_BAD_VARIABLE;
         }
 
-        // we've found a "+" or "-".  The character before
-        // this character must be a 'e' or 'E' and the rest of
-        // the string must only be digits
+        // we've found a "+" or "-".  A sign can only be part of a symbol
+        // when the symbol is a number in exponential notation, so the
+        // character before the sign must be an 'e' or 'E' (which also
+        // rules out a sign at the very start of the string), and the
+        // rest of the string must only be digits
 
-        if (Utilities::toUpper(*(scan - 1)) != 'E')
+        const char *exponent = scan - 1;
+        if (scan == string->getStringData() || Utilities::toUpper(*exponent) != 'E')
         {
             return STRING_BAD_VARIABLE;
         }
@@ -1827,8 +1867,34 @@ StringSymbolType LanguageParser::scanSymbol(RexxString *string)
             }
             scan++;
         }
-        // we've seen an exponent value.
-        haveExponent = true;
+
+        // everything before the 'E' must be a valid mantissa: digits
+        // with at most one period, and at least one digit.  Anything
+        // else (e.g. "A23E+2", ".E+2", "1AE+2", "1E2E+3") is not a
+        // symbol at all (bug #2080)
+        size_t digits = 0;
+        size_t periods = 0;
+        for (const char *mantissa = string->getStringData(); mantissa < exponent; mantissa++)
+        {
+            if (Utilities::isDigit(*mantissa))
+            {
+                digits++;
+            }
+            else if (*mantissa == '.')
+            {
+                periods++;
+            }
+            else
+            {
+                return STRING_BAD_VARIABLE;
+            }
+        }
+        if (digits == 0 || periods > 1)
+        {
+            return STRING_BAD_VARIABLE;
+        }
+        // a valid number in exponential notation
+        return STRING_NUMERIC;
     }
     // we've scanned the entire string and it is "provisionally" valid.
 
@@ -1841,14 +1907,9 @@ StringSymbolType LanguageParser::scanSymbol(RexxString *string)
             return STRING_LITERAL_DOT;
         }
         // more than one period precludes this being a valid
-        // number.  It also negates the validity of an exponent
-        // if we've seen one.
+        // number (a signed exponent has already been dealt with above)
         else if (compound > 1)
         {
-            if (haveExponent)
-            {
-                return STRING_BAD_VARIABLE;
-            }
             // just a literal token
             return STRING_LITERAL;
         }
@@ -1876,15 +1937,11 @@ StringSymbolType LanguageParser::scanSymbol(RexxString *string)
                 return STRING_NUMERIC;
             }
 
-            // found a potential exponent.  If the next character is
-            // "+" or "-", we already validated everything past that point
+            // found a potential exponent.  A signed exponent has already
+            // been dealt with above, so only an unsigned one is possible here
             if (Utilities::toUpper(*scan) == 'E')
             {
                 scan++;
-                if (*scan == '-' || *scan == '+')
-                {
-                    return STRING_NUMERIC;
-                }
 
                 // after the 'E', we expect to find digits
                 while (scan < linend)

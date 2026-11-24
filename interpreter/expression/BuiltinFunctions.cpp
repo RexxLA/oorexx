@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -57,6 +57,8 @@
 #include "PackageManager.hpp"
 #include "SystemInterpreter.hpp"
 #include "SysFileSystem.hpp"
+#include "SysProcess.hpp"
+#include "BuiltinFunctionSupport.hpp"
 #include "MethodArguments.hpp"
 #include "NumberStringClass.hpp"
 
@@ -155,6 +157,8 @@ BUILTIN(INSERT)
 
     fix_args(INSERT);
 
+    builtinScope.targetIs(2);           // INSERT calls a method of its argument 2
+
     RexxString *newString = required_string(INSERT, new);
     RexxString *target = required_string(INSERT, target);
     RexxInteger *n = optional_integer(INSERT, n);
@@ -195,6 +199,8 @@ BUILTIN(OVERLAY)
 
     fix_args(OVERLAY);
 
+    builtinScope.targetIs(2);           // OVERLAY calls a method of its argument 2
+
     RexxString *newString = required_string(OVERLAY, new);
     RexxString *target = required_string(OVERLAY, target);
     RexxInteger *n = optional_integer(OVERLAY, n);
@@ -216,6 +222,8 @@ BUILTIN(POS)
 
     fix_args(POS);
 
+    builtinScope.targetIs(2);           // POS calls a method of its argument 2
+
     RexxString *needle = required_string(POS, needle);
     RexxString *haystack = required_string(POS, haystack);
     RexxInteger *start = optional_integer(POS, start);
@@ -235,6 +243,8 @@ BUILTIN(LASTPOS)
     const size_t LASTPOS_range =    4;
 
     fix_args(LASTPOS);
+
+    builtinScope.targetIs(2);           // LASTPOS calls a method of its argument 2
 
     RexxString *needle = required_string(LASTPOS, needle);
     RexxString *haystack = required_string(LASTPOS, haystack);
@@ -458,6 +468,8 @@ BUILTIN(WORDPOS)
     const size_t WORDPOS_start =  3;
 
     fix_args(WORDPOS);
+
+    builtinScope.targetIs(2);           // WORDPOS calls a method of its argument 2
 
     RexxString *phrase = required_string(WORDPOS, phrase);
     RexxString *string = required_string(WORDPOS, string);
@@ -848,23 +860,87 @@ BUILTIN(USERID)
 BUILTIN(ERRORTEXT)
 {
     const size_t ERRORTEXT_Min = 1;
-    const size_t ERRORTEXT_Max = 1;
+    const size_t ERRORTEXT_Max = 2;
     const size_t ERRORTEXT_n =   1;
+    const size_t ERRORTEXT_values = 2;
 
     check_args(ERRORTEXT);
 
-    // verify this is in range for a Rexx error condition (we only retrieve
-    // the major error message, which does not have substitutions)
-    wholenumber_t error_number = (required_integer(ERRORTEXT, n))->getValue();
-    if (error_number < 0 || error_number > 99)
+    // n can also be an error code with a minor number, nn.nnn, as RAISE
+    // SYNTAX and the CODE of a condition object have it: that gives the
+    // secondary message, with its substitution markers (&1, &2...) as they
+    // are.  The parts are read as written, not as a number: "40.1" is
+    // 40.001, and "40.10" 40.010.  A whole number ("40.0", "4.0E1") is
+    // still read as a major error number, as it always was.
+    RexxObject *argument = get_arg(ERRORTEXT, n);
+    Protected<RexxString> code;
+    const char *decimalPoint = NULL;
+    wholenumber_t whole;
+    if (argument != OREF_NULL && (isString(argument) || isNumberString(argument)))
     {
-        reportException(Error_Incorrect_call_range, "ERRORTEXT", IntegerOne, error_number);
+        code = argument->requestString();
+        if (!code->numberValue(whole))
+        {
+            decimalPoint = (const char *)memchr(code->getStringData(), '.', code->getLength());
+        }
     }
+
+    wholenumber_t message_number;
+    if (decimalPoint == NULL)
+    {
+        // verify this is in range for a Rexx error condition
+        wholenumber_t error_number = (required_integer(ERRORTEXT, n))->getValue();
+        if (error_number < 0 || error_number > 99)
+        {
+            reportException(Error_Incorrect_call_range, "ERRORTEXT", IntegerOne, error_number);
+        }
+        message_number = error_number * 1000;
+    }
+    else
+    {
+        size_t majorLength = decimalPoint - code->getStringData();
+        wholenumber_t major;
+        wholenumber_t minor;
+        if (!new_string(code->getStringData(), majorLength)->numberValue(major) || major < 0 || major > 99 ||
+            !new_string(decimalPoint + 1, code->getLength() - majorLength - 1)->numberValue(minor) || minor < 0 || minor > 999)
+        {
+            reportException(Error_Incorrect_call_error_code, "ERRORTEXT", IntegerOne, code);
+        }
+        message_number = major * 1000 + minor;
+    }
+    // the optional values fill the substitution markers, by the same rules
+    // as when the interpreter raises the error: so that
+    // ERRORTEXT(c~code, c~additional) is the MESSAGE of a SYNTAX condition
+    // object c.  Without them, the markers are returned as they are.  A
+    // single string is taken as an array with one item, as ("x") is not an
+    // array term.
+    RexxObject *values = optional_argument(ERRORTEXT, values);
+    Protected<ArrayClass> substitutions;
+    if (values != OREF_NULL)
+    {
+        if (isString(values) || isNumberString(values) || isInteger(values) || values->isInstanceOf(TheStringClass))
+        {
+            substitutions = new_array(values);
+        }
+        else if (values->isInstanceOf(TheArrayClass) && !((ArrayClass *)values)->isMultiDimensional())
+        {
+            substitutions = (ArrayClass *)values;
+        }
+        else
+        {
+            reportException(Error_Incorrect_call_array, "ERRORTEXT", IntegerTwo, values);
+        }
+    }
+
     // get the error message for this number and return the text.
-    RexxString *result = Interpreter::getMessageText(error_number * 1000);
+    RexxString *result = Interpreter::getMessageText(message_number);
     if (result == OREF_NULL)
     {
-        result = GlobalNames::NULLSTRING;
+        return GlobalNames::NULLSTRING;
+    }
+    if (!substitutions.isNull())
+    {
+        result = context->getActivity()->messageSubstitution(result, substitutions);
     }
     return result;
 }
@@ -1059,6 +1135,7 @@ BUILTIN(DATE)
         }
     }
 
+    size_t outputSeparatorLength = 0;
     const char *outputSeparator = NULL;      // each format has it's own default
 
     // validate the output separator is only used with supported styles
@@ -1070,13 +1147,13 @@ BUILTIN(DATE)
             reportException(Error_Incorrect_call_format_incomp_sep, "DATE", IntegerOne, new_string((char)style), IntegerFour);
         }
         // must be zero or 1 character and cannot be alpha numeric
-        if (osep->getLength() > 1 || (osep->getLength() == 1 && strchr(ALPHANUM, osep->getChar(0)) != NULL))
+        if (osep->getLength() > 1 || (osep->getLength() == 1 && memchr(ALPHANUM, osep->getChar(0), strlen(ALPHANUM)) != NULL))
         {
             reportException(Error_Incorrect_call_parm_wrong_sep, "DATE", IntegerFour, osep);
         }
-        // string objects are null terminated, so we can point directly at what will
-        // be either 1 or 0 characters of data.
+        // we keep an explicit length to allow '00'x as separator
         outputSeparator = osep->getStringData();
+        outputSeparatorLength = osep->getLength();
     }
 
     // given an input timestamp to parse?  Need to figure out the form
@@ -1084,6 +1161,7 @@ BUILTIN(DATE)
     {
         bool valid = true;
 
+        size_t separatorLength = 0;
         const char *separator = NULL;      // different formats will override this
 
         // if we have a separator for input, perform validation here
@@ -1092,20 +1170,19 @@ BUILTIN(DATE)
             // only valid with certain styles
             if (strchr("BDFLMTW", style2) != NULL)
             {
-                reportException(Error_Incorrect_call_format_incomp_sep, "DATE", IntegerThree, new_string((char *)&style2, 1), IntegerFive);
+                reportException(Error_Incorrect_call_format_incomp_sep, "DATE", IntegerThree, new_string((char)style2), IntegerFive);
             }
 
             // explicitly specified delimiter, we need to validate this first
-            if (isep->getLength() > 1 || (isep->getLength() == 1 && strchr(ALPHANUM, isep->getChar(0)) != NULL))
+            if (isep->getLength() > 1 || (isep->getLength() == 1 && memchr(ALPHANUM, isep->getChar(0), strlen(ALPHANUM)) != NULL))
             {
                 // the field delimiter must be a single character and NOT
-                // alphanumeric, or a null character
+                // alphanumeric.  '00'x is a valid separator.
                 reportException(Error_Incorrect_call_parm_wrong_sep, new_string("DATE"), IntegerFive, isep);
             }
 
-            // string objects are null terminated, so we can point directly at what will
-            // be either 1 or 0 characters of data.
             separator = isep->getStringData();
+            separatorLength = isep->getLength();
         }
 
         // clear the time stamp copy
@@ -1117,7 +1194,7 @@ BUILTIN(DATE)
         {
             // 'N'ormal
             case 'N':
-                valid = timestamp.parseNormalDate(indate->getStringData(), separator);
+                valid = timestamp.parseNormalDate(indate->getStringData(), indate->getLength(), separator, separatorLength);
                 break;
 
             // 'B'asedate
@@ -1127,7 +1204,7 @@ BUILTIN(DATE)
                 wholenumber_t basedays;
                 if (!indate->numberValue(basedays) || !timestamp.setBaseDate(basedays))
                 {
-                    reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char *)&style2, 1));
+                    reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char)style2));
                 }
                 break;
             }
@@ -1139,7 +1216,7 @@ BUILTIN(DATE)
                 int64_t basetime;
                 if (!Numerics::objectToInt64(indate, basetime) || !timestamp.setBaseTime(basetime))
                 {
-                    reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char *)&style2, 1));
+                    reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char)style2));
                 }
                 break;
             }
@@ -1150,7 +1227,7 @@ BUILTIN(DATE)
                 int64_t basetime;
                 if (!Numerics::objectToInt64(indate, basetime) || !timestamp.setUnixTime(basetime))
                 {
-                    reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char *)&style2, 1));
+                    reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char)style2));
                 }
                 break;
             }
@@ -1160,10 +1237,10 @@ BUILTIN(DATE)
             {
                 // smaller numeric value
                 wholenumber_t yearday;
-                if (!indate->numberValue(yearday) || yearday < 0 || yearday > YEAR_DAYS + 1 ||
+                if (!indate->numberValue(yearday) || yearday < 1 || yearday > YEAR_DAYS + 1 ||
                     (yearday > YEAR_DAYS && !LeapYear(current.year)))
                 {
-                    reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char *)&style2, 1));
+                    reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char)style2));
                 }
                 // set the date directly
                 timestamp.setDate(current.year, yearday);
@@ -1172,32 +1249,32 @@ BUILTIN(DATE)
 
             // 'E'uropean format, days-month-year
             case 'E':
-                valid = timestamp.parseEuropeanDate(indate->getStringData(), separator, current.year);
+                valid = timestamp.parseEuropeanDate(indate->getStringData(), indate->getLength(), separator, separatorLength, current.year);
                 break;
 
             // 'O'rdered format, year-month-day
             case 'O':
-                valid = timestamp.parseOrderedDate(indate->getStringData(), separator, current.year);
+                valid = timestamp.parseOrderedDate(indate->getStringData(), indate->getLength(), separator, separatorLength, current.year);
                 break;
 
             // 'I'SO 8601 format
             case 'I':
-                valid = timestamp.parseISODate(indate->getStringData(), separator);
+                valid = timestamp.parseISODate(indate->getStringData(), indate->getLength(), separator, separatorLength);
                 break;
 
             // 'S'tandard format
             case 'S':
-                valid = timestamp.parseStandardDate(indate->getStringData(), separator);
+                valid = timestamp.parseStandardDate(indate->getStringData(), indate->getLength(), separator, separatorLength);
                 break;
 
             // 'U'SA format, month-day-year
             case 'U':
-                valid = timestamp.parseUsaDate(indate->getStringData(), separator, current.year);
+                valid = timestamp.parseUsaDate(indate->getStringData(), indate->getLength(), separator, separatorLength, current.year);
                 break;
 
             // invalid input option
             default:
-                reportException(Error_Incorrect_call_list, "DATE", IntegerThree, "BDEFINOSTU", new_string((char *)&style2, 1));
+                reportException(Error_Incorrect_call_list, "DATE", IntegerThree, "BDEFINOSTU", new_string((char)style2));
                 break;
         }
 
@@ -1211,7 +1288,7 @@ BUILTIN(DATE)
             }
             else
             {
-                reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char *)&style2, 1));
+                reportException(Error_Incorrect_call_format_invalid, "DATE", indate, new_string((char)style2));
             }
         }
     }
@@ -1233,34 +1310,33 @@ BUILTIN(DATE)
     {
 
         case 'B':
-            // always return RexxInteger instead of String
+            // always return as RexxInteger
             return new_integer(timestamp.getBaseDate());
 
         case 'F':
-            // if possible, return RexxInteger instead of String
-#ifdef __REXX64__
-            return new_integer(timestamp.getBaseTime());
-#else
-            timestamp.formatBaseTime(work);
-            break;
-#endif
+            // return as RexxInteger, or as NumberString if too large
+            return Numerics::int64ToObject(timestamp.getBaseTime());
 
         case 'T':
-            // if possible, return RexxInteger instead of String
-#ifdef __REXX64__
-            return new_integer(timestamp.getUnixTime());
-#else
-            timestamp.formatUnixTime(work);
-            break;
-#endif
+            // return as RexxInteger, or as NumberString if too large
+            return Numerics::int64ToObject(timestamp.getUnixTime());
 
         case 'D':
-            // always return RexxInteger instead of String
+            // always return as RexxInteger
             return new_integer(timestamp.getYearDay());
 
+
         case 'E':
-            timestamp.formatEuropeanDate(work, sizeof(work), outputSeparator);
-            break;
+        case 'I':
+        case 'N':
+        case 'O':
+        case 'S':
+        case 'U':
+        {
+            size_t length = timestamp.formatDate(work, sizeof(work), style,
+                outputSeparator, outputSeparatorLength);
+            return new_string(work, length);
+        }
 
         case 'L':
         {
@@ -1276,25 +1352,6 @@ BUILTIN(DATE)
             timestamp.formatMonthName(work);
             break;
 
-        case 'N':
-            timestamp.formatNormalDate(work, sizeof(work), outputSeparator);
-            break;
-
-        case 'O':
-            timestamp.formatOrderedDate(work, sizeof(work), outputSeparator);
-            break;
-
-        case 'I':
-            timestamp.formatISODate(work, sizeof(work), outputSeparator);
-            break;
-
-        case 'S':
-            timestamp.formatStandardDate(work, sizeof(work), outputSeparator);
-            break;
-
-        case 'U':
-            timestamp.formatUsaDate(work, sizeof(work), outputSeparator);
-            break;
 
         case 'W':
             timestamp.formatWeekDay(work);
@@ -1367,10 +1424,11 @@ BUILTIN(TIME)
         // the input timestamp is not valid with the elapsed time options
         if (style == 'R' || style == 'E')
         {
-            reportException(Error_Incorrect_call_invalid_conversion, "TIME", new_string((char *)&style, 1));
+            reportException(Error_Incorrect_call_invalid_conversion, "TIME", new_string((char)style));
         }
         bool valid = true;                 // assume this is a good timestamp
         timestamp.clear();                 // clear everything out
+        timestamp.setDate(1, 1);           // time-only conversions use 01 Jan 0001
         // everything is done using the current timezone offset
         timestamp.setTimeZoneOffset(current.getTimeZoneOffset());
 
@@ -1378,17 +1436,17 @@ BUILTIN(TIME)
         {
             // 'N'ormal default style, 01:23:45 format (24 hour)
             case 'N':
-                valid = timestamp.parseNormalTime(intime->getStringData());
+                valid = timestamp.parseNormalTime(intime->getStringData(), intime->getLength());
                 break;
 
             // 'C'ivil time, 1:23pm format (12-hour, no zero)
             case 'C':
-                valid = timestamp.parseCivilTime(intime->getStringData());
+                valid = timestamp.parseCivilTime(intime->getStringData(), intime->getLength());
                 break;
 
             // 'L'ong time, full 24-hour, plus fractional
             case 'L':
-                valid = timestamp.parseLongTime(intime->getStringData());
+                valid = timestamp.parseLongTime(intime->getStringData(), intime->getLength());
                 break;
 
             // 'H'our format...
@@ -1443,7 +1501,7 @@ BUILTIN(TIME)
         }
         if (!valid)
         {
-            reportException(Error_Incorrect_call_format_invalid, "TIME", intime, new_string((char *)&style2, 1));
+            reportException(Error_Incorrect_call_format_invalid, "TIME", intime, new_string((char)style2));
         }
     }
 
@@ -1490,7 +1548,7 @@ BUILTIN(TIME)
             break;
 
         case 'H':                         // 'Hours'
-            // always return RexxInteger instead of String
+            // always return as RexxInteger
             return new_integer(timestamp.hours);
 
         case 'L':                         // 'L'ong format
@@ -1498,7 +1556,7 @@ BUILTIN(TIME)
             break;
 
         case 'M':                         // 'M'inutes format
-            // always return RexxInteger instead of String
+            // always return as RexxInteger
             return new_integer(timestamp.hours * MINUTES_IN_HOUR + timestamp.minutes);
 
         case 'N':                         // 'N'ormal format...the default
@@ -1506,35 +1564,20 @@ BUILTIN(TIME)
             break;
 
         case 'S':                         // 'S'econds format...total seconds
-            // always return RexxInteger instead of String
+            // always return as RexxInteger
             return new_integer((timestamp.hours * MINUTES_IN_HOUR + timestamp.minutes) * SECONDS_IN_MINUTE + timestamp.seconds);
 
         case 'F':                          // 'F'ull
-            // if possible, return RexxInteger instead of String
-#ifdef __REXX64__
-            return new_integer(timestamp.getBaseTime());
-#else
-            timestamp.formatBaseTime(work);
-            break;
-#endif
+            // return as RexxInteger, or as NumberString if too large
+            return Numerics::int64ToObject(timestamp.getBaseTime());
 
         case 'T':                          // 'T'icks
-            // if possible, return RexxInteger instead of String
-#ifdef __REXX64__
-            return new_integer(timestamp.getUnixTime());
-#else
-            timestamp.formatUnixTime(work);
-            break;
-#endif
+            // return as RexxInteger, or as NumberString if too large
+            return Numerics::int64ToObject(timestamp.getUnixTime());
 
         case 'O':                          // 'O'ffset.  microseconds offset from UTC
-            // if possible, return RexxInteger instead of String
-#ifdef __REXX64__
-            return new_integer(timestamp.timeZoneOffset);
-#else
-            timestamp.formatTimeZone(work);
-            break;
-#endif
+            // return as RexxInteger, or as NumberString if too large
+            return Numerics::int64ToObject(timestamp.timeZoneOffset);
 
         // unknown output format
         default:
@@ -1693,8 +1736,9 @@ BUILTIN(XRANGE)
 
             length = 1 + (endchar < startchar ? 256 - startchar + endchar : endchar - startchar);
 
-            // just two args?  we can finish this early
-            if (mode == CALC_LENGTH && argcount <= 2)
+            // return early only if this is the first and only sequence
+            // two args can also be a character class followed by a start byte
+            if (mode == CALC_LENGTH && argcount <= 2 && XRANGE_arg == 2)
             {
                 // create a new string to build the result
                 result = raw_string(length);
@@ -1956,7 +2000,7 @@ BUILTIN(SIGN)
     // do this on the string value
     if (isInteger(argument))
     {
-        return((RexxInteger *)argument)->sign();
+        return ((RexxInteger *)argument)->sign();
     }
     else if (isNumberString(argument))
     {
@@ -2004,7 +2048,7 @@ BUILTIN(MAX)
     // do this on the string value
     if (isInteger(argument))
     {
-        return((RexxInteger *)argument)->Max(stack->arguments(argcount - 1), argcount - 1);
+        return ((RexxInteger *)argument)->Max(stack->arguments(argcount - 1), argcount - 1);
     }
     else if (isNumberString(argument))
     {
@@ -2033,7 +2077,7 @@ BUILTIN(MIN)
     // do this on the string value
     if (isInteger(argument))
     {
-        return((RexxInteger *)argument)->Min(stack->arguments(argcount - 1), argcount - 1);
+        return ((RexxInteger *)argument)->Min(stack->arguments(argcount - 1), argcount - 1);
     }
     else if (isNumberString(argument))
     {
@@ -2123,6 +2167,35 @@ bool check_queue(RexxString *name)
 }
 
 
+/**
+ * The position and count arguments of the stream functions (LINEIN's line,
+ * CHARIN's start...) are checked here.  Otherwise the stream object's
+ * methods report them with their own argument positions, as method errors,
+ * and not at all when the stream cannot be opened (bugs #2011, #2014).
+ *
+ * @param function The function name.
+ * @param position The argument position.
+ * @param value    The argument (already a whole number), or OREF_NULL.
+ */
+static void positiveStreamArgument(const char *function, size_t position, RexxObject *value)
+{
+    int64_t n;
+    if (value != OREF_NULL && Numerics::objectToInt64(value, n) && n <= 0)
+    {
+        reportException(Error_Incorrect_call_positive, function, position, value);
+    }
+}
+
+static void nonNegativeStreamArgument(const char *function, size_t position, RexxObject *value)
+{
+    int64_t n;
+    if (value != OREF_NULL && Numerics::objectToInt64(value, n) && n < 0)
+    {
+        reportException(Error_Incorrect_call_nonnegative, function, position, value);
+    }
+}
+
+
 BUILTIN(LINEIN)
 {
     const size_t LINEIN_Min = 0;
@@ -2136,6 +2209,14 @@ BUILTIN(LINEIN)
     RexxString *name = optional_string(LINEIN, name);
     RexxObject *line = optional_big_integer(LINEIN, line);
     RexxObject *count = optional_big_integer(LINEIN, count);
+
+    positiveStreamArgument("LINEIN", LINEIN_line, line);
+    // LINEIN reads one line or none
+    int64_t lines;
+    if (count != OREF_NULL && Numerics::objectToInt64(count, lines) && lines != 0 && lines != 1)
+    {
+        reportException(Error_Incorrect_call_list, "LINEIN", new_integer(LINEIN_count), "0, 1", count);
+    }
 
     // if this is linein request for "QUEUE:, this is really a pull
     // operation.
@@ -2196,6 +2277,9 @@ BUILTIN(CHARIN)
     RexxObject *position = optional_big_integer(CHARIN, start);
     RexxObject *count = optional_big_integer(CHARIN, count);
 
+    positiveStreamArgument("CHARIN", CHARIN_start, position);
+    nonNegativeStreamArgument("CHARIN", CHARIN_count, count);
+
     // queue is not allowed for CHARIN
     if (check_queue(name))
     {
@@ -2237,6 +2321,8 @@ BUILTIN(LINEOUT)
     RexxString *name = optional_string(LINEOUT, name);
     RexxString *string = optional_string(LINEOUT, string);
     RexxObject *line = optional_big_integer(LINEOUT, line);
+
+    positiveStreamArgument("LINEOUT", LINEOUT_line, line);
 
     // lineout is allowed to the queue
     if (check_queue(name))
@@ -2302,6 +2388,8 @@ BUILTIN(CHAROUT)
     RexxString *name = optional_string(CHAROUT, name);
     RexxString *string = optional_string(CHAROUT, string);
     RexxObject *position = optional_big_integer(CHAROUT, start);
+
+    positiveStreamArgument("CHAROUT", CHAROUT_start, position);
 
     // queues are not allowed with charout
     if (check_queue(name))
@@ -2739,6 +2827,8 @@ BUILTIN(CHANGESTR)
 
     fix_args(CHANGESTR);
 
+    builtinScope.targetIs(2);           // CHANGESTR calls a method of its argument 2
+
     RexxString *needle = required_string(CHANGESTR, needle);
     RexxString *haystack = required_string(CHANGESTR, haystack);
     RexxString *newneedle = required_string(CHANGESTR, newneedle);
@@ -2756,6 +2846,8 @@ BUILTIN(COUNTSTR)
     const size_t COUNTSTR_haystack =   2;
 
     fix_args(COUNTSTR);
+
+    builtinScope.targetIs(2);           // COUNTSTR calls a method of its argument 2
 
     RexxString *needle = required_string(COUNTSTR, needle);
     RexxString *haystack = required_string(COUNTSTR, haystack);
@@ -2982,7 +3074,6 @@ BUILTIN(ENDLOCAL)
     return SystemInterpreter::popEnvironment(context);
 }
 
-
 /**
  * Qualify a stream name.
  */
@@ -2999,6 +3090,262 @@ BUILTIN(QUALIFY)
     QualifiedName qualified_name(name->getStringData());
     return new_string(qualified_name);
 }
+
+/**
+ *  Invoke the garbage collector.
+ */
+BUILTIN(GC)
+{
+    const size_t GC_Min = 0;
+    const size_t GC_Max = 1;
+    const size_t GC_force = 1;
+
+    check_args(GC);
+
+    RexxString *force = optional_string(GC, force);
+
+    bool bRunGC=false;  // default to not run in release mode
+
+    if (force != OREF_NULL) // argument given, check whether argument starts with "F" for "force" ...
+    {
+        const char *forceData = force->getStringData();
+        if (forceData[0]!='f' && forceData[0]!='F')
+        {
+            reportException(Error_Incorrect_call_list, "GC", IntegerOne, new_string("\"force\", \"Force\", \"f\", \"F\"",26), force);
+        }
+        bRunGC=true;        // run the garbage collector in release mode
+    }
+
+#ifdef _DEBUG           // in debug mode always run the GC
+    bRunGC=true;
+#endif
+
+    if (bRunGC)
+    {
+        memoryObject.collectAndUninit(false);   // keep stack
+        return TheTrueObject;   // indicate we called the garbage collector
+    }
+    return TheFalseObject;      // indicate we did not call the garbage collector
+}
+
+
+/**
+ * Raise 40.927: a built-in function argument outside its range.
+ *
+ * @param function The function name.
+ * @param position The argument position.
+ * @param minimum  The smallest value allowed.
+ * @param maximum  The largest value allowed.
+ * @param value    The value found.
+ */
+static void reportRangeError(const char *function, size_t position, wholenumber_t minimum,
+    wholenumber_t maximum, wholenumber_t value)
+{
+    Protected<ArrayClass> subs = new_array((size_t)5);
+    subs->put(new_string(function), 1);
+    subs->put(new_integer(position), 2);
+    subs->put(new_integer(minimum), 3);
+    subs->put(new_integer(maximum), 4);
+    subs->put(new_integer(value), 5);
+    reportException(Error_Incorrect_call_range_limits, subs);
+}
+
+
+// the shared work of BEEP, DIRECTORY and FILESPEC (see BuiltinFunctionSupport.hpp)
+
+const char *const BuiltinFunctionSupport::FilespecOptions = "DELNP";
+
+/**
+ * Sound the speaker.  The arguments have been checked by the caller.
+ *
+ * @param frequency The frequency, in Hertz.
+ * @param duration  The duration, in milliseconds.
+ */
+void BuiltinFunctionSupport::beep(wholenumber_t frequency, wholenumber_t duration)
+{
+    SysProcess::beep((int)frequency, (int)duration);
+}
+
+
+/**
+ * Get the current directory, after changing it first if a new one is given.
+ *
+ * @param newDirectory
+ *                  The directory to change to, or NULL.
+ * @param qualified A buffer for the qualified name of the new directory.
+ * @param current   The buffer that receives the current directory.
+ *
+ * @return false if the new directory could not be set (and the current
+ *         directory has not been retrieved).
+ */
+bool BuiltinFunctionSupport::directory(const char *newDirectory, FileNameBuffer &qualified, FileNameBuffer &current)
+{
+    if (newDirectory != NULL)
+    {
+        SysFileSystem::qualifyStreamName(newDirectory, qualified);
+        if (!SysFileSystem::setCurrentDirectory(qualified))
+        {
+            return false;
+        }
+    }
+    SysFileSystem::getCurrentDirectory(current);
+    return true;
+}
+
+
+/**
+ * Find a part of a file specification.
+ *
+ * @param option The part (uppercase): D (drive), E (extension), L (location:
+ *               drive and path), N (name) or P (path, without the drive).
+ * @param name   The file specification.  It ends at its first null
+ *               character, as it always has.
+ * @param part   Receives the start of the part.
+ * @param length Receives the length of the part (0 if there is none).
+ *
+ * @return false for an unknown option.
+ */
+bool BuiltinFunctionSupport::filespec(char option, const char *name, const char *&part, size_t &length)
+{
+    const char *endPtr = name + strlen(name);
+
+    const char *pathStart = SysFileSystem::getPathStart(name);
+    const char *pathEnd = SysFileSystem::getPathEnd(name);
+
+    // pathEnd is made one character past the end of the path, so that the
+    // length is pathEnd - pathStart even when there is no path
+    pathEnd = pathEnd == NULL ? pathStart : pathEnd + 1;
+    // and the name starts at the beginning when there is no path at all
+    const char *nameStart = pathEnd == name ? name : pathEnd;
+
+    switch (option)
+    {
+        case 'P':                        // the path, without the drive
+            part = pathStart;
+            length = pathEnd - pathStart;
+            return true;
+
+        case 'N':                        // the file name
+            part = nameStart;
+            length = endPtr - nameStart;
+            return true;
+
+        case 'L':                        // the location: drive and path
+            part = name;
+            length = pathEnd - name;
+            return true;
+
+        case 'D':                        // the drive (nothing if none)
+            part = name;
+            length = pathStart - name;
+            return true;
+
+        case 'E':                        // the extension, without the period
+        {
+            const char *lastDot = strrchr(name, '.');
+            if (lastDot != NULL && lastDot >= nameStart)
+            {
+                part = lastDot + 1;
+                length = endPtr - part;
+            }
+            else
+            {
+                part = endPtr;
+                length = 0;
+            }
+            return true;
+        }
+
+        default:
+            return false;
+    }
+}
+
+
+/**
+ * Sound the speaker at a frequency (in Hertz) for a duration (in
+ * milliseconds).
+ */
+BUILTIN(BEEP)
+{
+    const size_t BEEP_Min = 2;
+    const size_t BEEP_Max = 2;
+    const size_t BEEP_frequency = 1;
+    const size_t BEEP_duration = 2;
+
+    check_args(BEEP);
+
+    wholenumber_t frequency = required_integer(BEEP, frequency)->getValue();
+    if (frequency < BuiltinFunctionSupport::MinBeepFrequency || frequency > BuiltinFunctionSupport::MaxBeepFrequency)
+    {
+        reportRangeError("BEEP", BEEP_frequency, BuiltinFunctionSupport::MinBeepFrequency,
+            BuiltinFunctionSupport::MaxBeepFrequency, frequency);
+    }
+    wholenumber_t duration = required_integer(BEEP, duration)->getValue();
+    if (duration < BuiltinFunctionSupport::MinBeepDuration || duration > BuiltinFunctionSupport::MaxBeepDuration)
+    {
+        reportRangeError("BEEP", BEEP_duration, BuiltinFunctionSupport::MinBeepDuration,
+            BuiltinFunctionSupport::MaxBeepDuration, duration);
+    }
+
+    BuiltinFunctionSupport::beep(frequency, duration);
+    return GlobalNames::NULLSTRING;
+}
+
+
+/**
+ * Return the current directory, after changing it first if a
+ * new one is given.  A directory that cannot be set returns
+ * the null string.
+ */
+BUILTIN(DIRECTORY)
+{
+    const size_t DIRECTORY_Min = 0;
+    const size_t DIRECTORY_Max = 1;
+    const size_t DIRECTORY_name = 1;
+
+    check_args(DIRECTORY);
+
+    RexxString *name = optional_string(DIRECTORY, name);
+
+    FileNameBuffer qualified;
+    FileNameBuffer current;
+    if (!BuiltinFunctionSupport::directory(name == OREF_NULL ? NULL : name->getStringData(), qualified, current))
+    {
+        return GlobalNames::NULLSTRING;
+    }
+    return new_string((const char *)current);
+}
+
+
+/**
+ * Return a part of a file specification: its drive, path,
+ * location (drive and path), name or extension.
+ */
+BUILTIN(FILESPEC)
+{
+    const size_t FILESPEC_Min = 2;
+    const size_t FILESPEC_Max = 2;
+    const size_t FILESPEC_option = 1;
+    const size_t FILESPEC_name = 2;
+
+    check_args(FILESPEC);
+
+    RexxString *option = required_string(FILESPEC, option);
+    RexxString *name = required_string(FILESPEC, name);
+
+    char optionChar = option->getLength() == 0 ? '\0' : Utilities::toUpper(option->getChar(0));
+    const char *part;
+    size_t length;
+    if (!BuiltinFunctionSupport::filespec(optionChar, name->getStringData(), part, length))
+    {
+        // as always, only the first character of the option is shown
+        reportException(Error_Incorrect_call_list, "FILESPEC", IntegerOne, BuiltinFunctionSupport::FilespecOptions,
+            option->getLength() == 0 ? GlobalNames::NULLSTRING : option->extract(0, 1));
+    }
+    return new_string(part, length);
+}
+
 
 // the following builtin function table must maintain the same order
 // as the BuiltinCode type defined by the RexxToken class.
@@ -3085,5 +3432,9 @@ pbuiltin LanguageParser::builtinTable[] =
     &builtin_function_ENDLOCAL         ,
     &builtin_function_SETLOCAL         ,
     &builtin_function_QUALIFY          ,
+    &builtin_function_GC               ,
+    &builtin_function_BEEP             ,
+    &builtin_function_DIRECTORY        ,
+    &builtin_function_FILESPEC         ,
 };
 

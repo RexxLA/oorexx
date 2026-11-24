@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2018 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -63,8 +63,8 @@ typedef enum
     LostdigitsSyntax,
     NostringSyntax,
     NotreadySyntax,
+    NumericInherit,
 } PackageFlags;
-
 
 
 /**
@@ -114,6 +114,39 @@ class PackageSetting
     inline void   enableProlog() { packageOptions[NoProlog] = false; }
     inline void   disableProlog() { packageOptions[NoProlog] = true; }
     inline bool   isPrologEnabled() { return !packageOptions[NoProlog]; }
+
+    inline void   enableNumericInherit() { packageOptions[NumericInherit] = true; }
+    inline void   disableNumericInherit() { packageOptions[NumericInherit] = false; }
+    inline bool   isNumericInheritEnabled() { return packageOptions[NumericInherit]; }
+
+    // Return the package settings encoded as an ::OPTIONS string without trailing semi-colon.
+    RexxString *toString()
+    {
+        char buf[512]="";
+        snprintf(buf, 512, "::OPTIONS DIGITS %zd FORM %s FUZZ %zd NUMERIC %s ERROR %s FAILURE %s LOSTDIGITS %s NOSTRING %s NOTREADY %s NOVALUE %s %s TRACE %s",
+                         getDigits(),
+                         getForm()                   ? "ENGINEERING"      : "SCIENTIFIC",
+                         getFuzz(),
+                         isNumericInheritEnabled()   ? "INHERIT"          : "NOINHERIT",
+                         isErrorSyntaxEnabled()      ? "SYNTAX"           : "CONDITION",
+                         isFailureSyntaxEnabled()    ? "SYNTAX"           : "CONDITION",
+                         isLostdigitsSyntaxEnabled() ? "SYNTAX"           : "CONDITION",
+                         isNostringSyntaxEnabled()   ? "SYNTAX"           : "CONDITION",
+                         isNotreadySyntaxEnabled()   ? "SYNTAX"           : "CONDITION",
+                         isNovalueSyntaxEnabled()    ? "SYNTAX"           : "CONDITION",
+                         isPrologEnabled()           ? "PROLOG"           : "NOPROLOG" ,
+                traceSettings.tracingNormal()        ? "NORMAL"        :
+                traceSettings.tracingIntermediates() ? "INTERMEDIATES" :
+                traceSettings.tracingResults()       ? "RESULTS"       :
+                traceSettings.tracingAll()           ? "ALL"           :
+                traceSettings.tracingCommands()      ? "COMMANDS"      :
+                traceSettings.tracingErrors()        ? "ERROR"         :
+                traceSettings.tracingFailures()      ? "FAILURE"       :
+                traceSettings.tracingLabels()        ? "LABELS"        :
+                traceSettings.isTraceOff()           ? "OFF"           : "?n/a?"
+              );
+        return new_string(buf);
+    }
 
     NumericSettings numericSettings;       // the package numeric settings
     TraceSetting    traceSettings;         // the package trace setting

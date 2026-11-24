@@ -756,6 +756,38 @@
 #define Error_Invalid_argument_bad_date_msg                          836
 #define Error_Incorrect_method_request_type_msg                      837
 #define Error_Execution_circular_requires_msg                        838
+#define Error_Symbol_expected_numeric_subdirective_msg               839
+#define Error_Invalid_subkeyword_numeric_subdirective_msg            840
+#define Error_Invalid_subkeyword_duplicate_msg                       841
+#define Error_Invalid_subkeyword_conflict_msg                        842
+#define Error_Invalid_subkeyword_options_form_msg                    843
+#define Error_Variable_reference_use_default_msg                     844
+#define Error_Incorrect_call_error_code_msg                          845
+#define Error_Unexpected_end_catch_msg                               846
+#define Error_Symbol_expected_catch_msg                              847
+#define Error_Invalid_subkeyword_catch_msg                           848
+#define Error_Invalid_leave_leave_catch_msg                          849
+#define Error_Invalid_leave_iterate_catch_msg                        850
+#define Error_Unexpected_end_catch_then_msg                          851
+#define Error_Unexpected_end_catch_else_msg                          852
+#define Error_Invalid_expression_catch_syntax_msg                    853
+#define Error_Unexpected_end_finally_msg                             854
+#define Error_Unexpected_end_finally_then_msg                        855
+#define Error_Unexpected_end_finally_else_msg                        856
+#define Error_Unexpected_end_after_finally_msg                       857
+#define Error_Execution_finally_exit_msg                             858
+#define Error_Translation_finally_exit_msg                           859
+#define Error_Incorrect_call_range_limits_msg                        860
+#define Error_Translation_forward_finally_msg                        861
+#define Error_Symbol_expected_throw_msg                              862
+#define Error_Invalid_subkeyword_throw_msg                           863
+#define Error_Invalid_subkeyword_throwoption_msg                     864
+#define Error_Invalid_expression_throw_description_msg               865
+#define Error_Invalid_expression_throw_additional_msg                866
+#define Error_Program_interrupted_condition_description_msg          867
+#define Error_Expression_result_throw_msg                            868
+#define Error_Conversion_throw_msg                                   869
+#define Error_Execution_error_condition_throw_msg                    870
 
 
 #endif

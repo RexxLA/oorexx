@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2019 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -93,6 +93,7 @@ class NativeActivation : public ActivationBase
     void setFuzz(wholenumber_t) override;
     void setForm(bool) override;
     bool trap(RexxString *, DirectoryClass *) override;
+    bool trapRaised(RexxString *, DirectoryClass *) override;
     bool willTrap(RexxString *) override;
     void termination() override { guardOff(); }
     bool isStackBase() override;
@@ -155,10 +156,12 @@ class NativeActivation : public ActivationBase
     void setObjectVariable(const char *name, RexxObject *value);
     void dropObjectVariable(const char *name);
     DirectoryClass *getAllContextVariables();
-    inline void setConditionInfo(RexxString *name, DirectoryClass *info) { conditionName = name; conditionObj = info; }
+    inline void setConditionInfo(RexxString *name, DirectoryClass *info) { conditionName = name; conditionObj = info; calleeCondition = false; }
     void setConditionInfo(DirectoryClass *info);
+    void setCalleeConditionInfo(DirectoryClass *info);
     inline DirectoryClass *getConditionInfo() { return conditionObj; }
-    inline void clearException() { conditionName = OREF_NULL; conditionObj = OREF_NULL; }
+    inline DirectoryClass *getCalleeConditionInfo() { return calleeCondition ? conditionObj : OREF_NULL; }
+    inline void clearException() { conditionName = OREF_NULL; conditionObj = OREF_NULL; calleeCondition = false; }
     void clearCondition();
     void checkConditions();
     bool checkCondition(RexxString *name);
@@ -192,6 +195,7 @@ class NativeActivation : public ActivationBase
     void variablePoolRequest(PSHVBLOCK pshvblock);
     RexxReturnCode copyValue(RexxObject * value, RXSTRING *rxstring, size_t *length);
     RexxReturnCode copyValue(RexxObject * value, CONSTRXSTRING *rxstring, size_t *length);
+    int callBack(const char *name, size_t argc, PCONSTRXSTRING argv, short *returnCode, PRXSTRING result);
     int stemSort(StemClass *stem, const char *tailExtension, int order, int type, wholenumber_t start, wholenumber_t end, wholenumber_t firstcol, wholenumber_t lastcol);
     inline void enableConditionTrap() { trapConditions = true; captureConditions = false; }
     inline void enableConditionCapture() { trapConditions = true; captureConditions = true; }
@@ -199,6 +203,7 @@ class NativeActivation : public ActivationBase
     void forwardMessage(RexxObject *to, RexxString *msg, RexxClass *super, ArrayClass *args, ProtectedObject &result);
     void enableConditionTraps() { trapErrors = true; }
     void disableConditionTraps() { trapErrors = false; }
+    bool conditionTrapsEnabled() { return trapErrors; }
     StackFrameClass *createStackFrame();
     void *allocateObjectMemory(size_t size);
     void  freeObjectMemory(void *data);
@@ -241,6 +246,7 @@ protected:
     bool            trapErrors;          // we're trapping errors from external callers
     bool            trapConditions;      // trap any raised conditions
     bool            captureConditions;   // but don't propagate trapped conditions via throw.
+    bool            calleeCondition;     // conditionObj was RAISEd by Rexx code we called
     bool            variablePoolEnabled; // Variable pool access flag
                                          // our iterator for the variable pool next function
     VariableDictionary::VariableIterator iterator;

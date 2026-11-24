@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2021 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -988,7 +988,7 @@ MethodClass *RexxClass::method(RexxString  *method_name)
     // we keep the instance methods defined at this level in a separate
     // method dictionary that is used to build the behaviour.  We can retrieve
     // the method directly from there.
-    MethodClass *method_object = instanceMethodDictionary->getMethod(method_name);
+    MethodClass *method_object = (OREF_NULL == instanceMethodDictionary) ? OREF_NULL : instanceMethodDictionary->getMethod(method_name);
     // this is an error if it is not in the method dictionary.
     // Note that is could be there, but as .nil.  We will return that value
     if ( OREF_NULL == method_object)
@@ -1247,8 +1247,12 @@ MethodDictionary *RexxClass::createMethodDictionary(RexxObject *sourceCollection
     // it would be nice to just grab a table iterator, but we need to use
     // a supplier here.
     ProtectedObject p2;
-    sourceCollection->sendMessage(GlobalNames::SUPPLIER, p2);
-    SupplierClass *supplier = (SupplierClass *)(RexxObject *)p2;
+    SupplierClass *supplier = (SupplierClass *)sourceCollection->sendMessage(GlobalNames::SUPPLIER, p2);
+    // SUPPLIER can be a user method, and it can answer anything
+    if (supplier == OREF_NULL || !isOfClassType(Supplier, supplier))
+    {
+        reportException(Error_Execution_no_supplier, sourceCollection);
+    }
     for (; supplier->available() == TheTrueObject; supplier->next())
     {
         MethodClass *newMethod = (MethodClass *)supplier->item();
@@ -1577,6 +1581,11 @@ RexxClass  *RexxClass::subclass(PackageClass *package, RexxString *class_id,
     ProtectedObject p;
     // now get an instance of the meta class
     RexxClass *new_class = (RexxClass *)meta_class->sendMessage(GlobalNames::NEW, class_id, p);
+    // NEW can be a method of the metaclass, and it can answer anything
+    if (new_class == OREF_NULL || !new_class->isInstanceOf(TheClassClass))
+    {
+        reportException(Error_Translation_bad_metaclass, meta_class);
+    }
 
     // hook this up with the source as early as possible.
     new_class->setPackage(package);

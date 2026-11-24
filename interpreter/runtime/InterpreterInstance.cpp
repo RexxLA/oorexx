@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -102,7 +102,19 @@ InterpreterInstance::InterpreterInstance()
 void InterpreterInstance::live(size_t liveMark)
 {
     memory_mark(rootActivity);
-    memory_mark(allActivities);
+    // the list itself is not a Rexx object, but its contents are, and this is
+    // what keeps the activities alive. The resource lock is what the paths that
+    // maintain the list hold; we already have kernel access here, so taking it
+    // in that order is permitted.
+    {
+        ResourceSection lock;
+        std::vector<Activity *> &acts = allActivities.contents();
+        for (size_t i = 0; i < acts.size(); i++)
+        {
+            RexxInternalObject *entry = acts[i];
+            memory_mark(entry);
+        }
+    }
     memory_mark(defaultEnvironment);
     memory_mark(searchPath);
     memory_mark(searchExtensions);
@@ -122,15 +134,40 @@ void InterpreterInstance::live(size_t liveMark)
  */
 void InterpreterInstance::liveGeneral(MarkReason reason)
 {
-    memory_mark_general(rootActivity);
-    memory_mark_general(allActivities);
-    memory_mark_general(defaultEnvironment);
-    memory_mark_general(searchPath);
-    memory_mark_general(searchExtensions);
-    memory_mark_general(securityManager);
-    memory_mark_general(localEnvironment);
-    memory_mark_general(commandHandlers);
-    memory_mark_general(requiresFiles);
+    // Nothing owned by an interpreter instance belongs in the saved image, and
+    // both siblings guard their whole body the same way (Interpreter::liveGeneral,
+    // ActivityManager::liveGeneral). Guarding everything, rather than just the
+    // activity list, makes the invariant "this object contributes nothing to an
+    // image" checkable at a glance -- marking rootActivity would otherwise drag
+    // the whole activity graph in behind it, since Activity::liveGeneral has no
+    // guard of its own.
+    //
+    // The activity list makes this mandatory rather than merely tidy:
+    // createImage() calls liveGeneral(SAVINGIMAGE) on a bytewise COPY of this
+    // object in the image buffer, and a copied vector still points at the
+    // original's storage, so the write-back below would put image offsets into
+    // the live activity list.
+    if (reason != SAVINGIMAGE)
+    {
+        memory_mark_general(rootActivity);
+        ResourceSection lock;
+        std::vector<Activity *> &acts = allActivities.contents();
+        for (size_t i = 0; i < acts.size(); i++)
+        {
+            // markGeneral can update the reference, so write it back
+            RexxInternalObject *entry = acts[i];
+            memory_mark_general(entry);
+            acts[i] = (Activity *)entry;
+        }
+
+        memory_mark_general(defaultEnvironment);
+        memory_mark_general(searchPath);
+        memory_mark_general(searchExtensions);
+        memory_mark_general(securityManager);
+        memory_mark_general(localEnvironment);
+        memory_mark_general(commandHandlers);
+        memory_mark_general(requiresFiles);
+    }
 }
 
 
@@ -146,11 +183,19 @@ void InterpreterInstance::liveGeneral(MarkReason reason)
 void InterpreterInstance::initialize(Activity *activity, RexxOption *options)
 {
     rootActivity = activity;
-    allActivities = new_queue();
+    rootDetached = false;
     searchExtensions = new_array();       // this will be filled in during options processing
     requiresFiles = new_string_table();   // our list of loaded requires packages
-    // this gets added to the entire active list.
-    allActivities->append(activity);
+    // this gets added to the entire active list. The resource lock is required
+    // even though this thread holds kernel access: haltAllActivities() and
+    // traceAllActivities() read this list holding only the resource lock, and
+    // this instance is already published in interpreterInstances by the time
+    // initialize() runs, so they can reach it. Kernel access excludes only the
+    // collector.
+    {
+        ResourceSection lock;
+        allActivities.append(activity);
+    }
     // create a default wrapper for this security manager
     securityManager = new SecurityManager(OREF_NULL);
     // set the default system address environment (can be overridden by options)
@@ -197,7 +242,8 @@ void InterpreterInstance::setSecurityManager(RexxObject *m)
  */
 int InterpreterInstance::attachThread(RexxThreadContext *&attachedContext)
 {
-    Activity *activity = attachThread();
+    bool activityCreated = false;
+    Activity *activity = attachThread(activityCreated);
     attachedContext = activity->getThreadContext();
     // When we attach, we get the current lock.  We need to ensure we
     // release this before returning control to the outside world.
@@ -211,8 +257,9 @@ int InterpreterInstance::attachThread(RexxThreadContext *&attachedContext)
  *
  * @return The attached activity.
  */
-Activity *InterpreterInstance::attachThread()
+ Activity *InterpreterInstance::attachThread(bool &activityCreated)
 {
+    activityCreated = false;
     // first check for an existing activity
     Activity *oldActivity = findActivity();
     // do we have an activity for this already? There are possible
@@ -241,6 +288,7 @@ Activity *InterpreterInstance::attachThread()
     // we need to get a new activity set up for this particular thread
     // NB: The activity manager handles the special case of an activity
     // on the dispatch queue.
+    activityCreated = true;
     Activity *activity = ActivityManager::attachThread();
 
     // The creation of the new activity also made that activity the current
@@ -251,7 +299,7 @@ Activity *InterpreterInstance::attachThread()
     // the resource lock.
     ResourceSection lock;
     // add this to the activity lists
-    allActivities->append(activity);
+    allActivities.append(activity);
     // associate the thread with this instance
     activity->setupAttachedActivity(this);
     return activity;
@@ -289,13 +337,19 @@ bool InterpreterInstance::detachThread(Activity *activity)
     activity->releaseAccess();
     ResourceSection lock;
 
-    allActivities->removeItem(activity);
+    allActivities.removeItem(activity);
+    // if this is the thread that created the instance, its activity has now been
+    // returned and cleaned up: terminate() must neither count it nor return it again
+    if (activity == rootActivity)
+    {
+        rootDetached = true;
+    }
     // have the activity manager remove this from the global tables
     // and perform resource cleanup
     ActivityManager::returnActivity(activity);
 
     // Was this the last detach of an thread?  Signal the shutdown event
-    if (allActivities->items() <= 1 && terminating)
+    if (onlyRootLeft() && terminating)
     {
         terminationSem.post();
     }
@@ -332,7 +386,7 @@ Activity* InterpreterInstance::spawnActivity(Activity *parent)
     // add this to the activities list
     ResourceSection lock;
 
-    allActivities->append(activity);
+    allActivities.append(activity);
     return activity;
 }
 
@@ -353,13 +407,13 @@ bool InterpreterInstance::poolActivity(Activity *activity)
     // detach from this instance
     activity->detachInstance();
     // remove from the activities lists for the instance
-    allActivities->removeItem(activity);
+    allActivities.removeItem(activity);
     if (terminating)
     {
         // is this the last one to finish up?  Generally, the main thread
         // will be waiting for this to terminate.  That is thread 1, we're thread
         // 2.  In reality, this is the test for the last "spawned" thread.
-        if (allActivities->items() <= 1)
+        if (onlyRootLeft())
         {
             terminationSem.post();
         }
@@ -387,9 +441,9 @@ Activity* InterpreterInstance::findActivity(thread_id_t threadId)
     // NB:  New activities are pushed on to the end, so it's prudent to search
     // from the list end toward the front of the list.  Also, this ensures we
     // will find the toplevel activity nested on a given thread first.
-    for (size_t listIndex = allActivities->items(); listIndex > 0; listIndex--)
+    for (size_t listIndex = allActivities.items(); listIndex > 0; listIndex--)
     {
-        Activity *activity = (Activity *)allActivities->get(listIndex);
+        Activity *activity = (Activity *)allActivities.get(listIndex);
         // this should never happen, but we never return suspended threads
         if (activity->isThread(threadId) && !activity->isSuspended())
         {
@@ -419,15 +473,22 @@ Activity* InterpreterInstance::findActivity()
  * @return The activity object associated with this thread/instance
  *         combination.
  */
-Activity* InterpreterInstance::enterOnCurrentThread()
+Activity* InterpreterInstance::enterOnCurrentThread(bool &newActivity)
 {
-    // attach this thread to the current activity
-    Activity *activity = attachThread();
+    // attach this thread to the current activity and record if a new activity was created for this
+    Activity *activity = attachThread(newActivity);
     // indicate this is a nested entry
     activity->activate();
     // from this point forward, we want to be the active activity, so
-    // acquire the kernel lock
-    activity->requestApiAccess();
+    // acquire the kernel lock. A newly created activity already holds it:
+    // attachThread() returns with the lock and the activity set as the
+    // current one. Requesting it again would lock the (recursive) kernel
+    // mutex twice, and a releaseAccess() while it is held, such as an uninit
+    // method waiting for a guard, would then leave it locked (bug #1650).
+    if (!newActivity)
+    {
+        activity->requestApiAccess();
+    }
     // return the activity for use
     return activity;
 }
@@ -435,7 +496,7 @@ Activity* InterpreterInstance::enterOnCurrentThread()
 
 void InterpreterInstance::removeInactiveActivities()
 {
-    size_t count = allActivities->items();
+    size_t count = allActivities.items();
 
     // This is a bit complicated.  Each activity will be removed from the
     // head of the list, and any activity not ready for termination is
@@ -444,11 +505,17 @@ void InterpreterInstance::removeInactiveActivities()
     // If there are any items left, those are activities we can't release yet.
     for (size_t i = 0; i < count; i++)
     {
-        Activity *activity = (Activity *)allActivities->pull();
+        Activity *activity = (Activity *)allActivities.pull();
+        // the caller holds the resource lock, so the list cannot shrink under us
+        // and this cannot be NULL -- but do not dereference it on trust
+        if (activity == OREF_NULL)
+        {
+            break;
+        }
         // we never terminate the root activity or any activity current in use
         if (activity == rootActivity || activity->isActive())
         {
-            allActivities->append(activity);
+            allActivities.append(activity);
         }
         else
         {
@@ -499,7 +566,7 @@ bool InterpreterInstance::terminate()
         // go remove all of the activities that are not doing work for this instance
         removeInactiveActivities();
         // if we just have the single root activity left, then we can shutdown
-        terminated = allActivities->items() == 1;
+        terminated = onlyRootLeft();
     }
 
     // if there are active threads still running, we need to wait until
@@ -510,14 +577,14 @@ bool InterpreterInstance::terminate()
     }
 
     Activity *current;
-
+    bool activityCreated = false;
     try
     {
         // if everything has terminated, then make sure we run the uninits before shutting down.
         // This activity is currently the current activity.  We're going to run the
         // uninits on this one, so reactivate it until we're done running. If we were not actually
         // called on an attached thread, an attach will be performed.
-        current = enterOnCurrentThread();
+        current = enterOnCurrentThread(activityCreated);
 
         // this might be holding some local references. Make sure we clear these
         // before running the garbage collector
@@ -530,28 +597,54 @@ bool InterpreterInstance::terminate()
         // do system specific termination of an instance
         sysInstance.terminate();
 
+        // Unlink from the interpreter's instance list while we still hold kernel
+        // access. That list is a Rexx object the collector walks, so it must not
+        // be touched by a thread without kernel access: the resource lock this
+        // takes does not exclude the collector, which runs under the kernel lock.
+        // Taking the resource lock while holding kernel access is the permitted
+        // order. This has to follow collectAndUninit() above, which asks
+        // Interpreter::lastInstance() whether we are the last one.
+        Interpreter::terminateInterpreterInstance(this);
+
         // ok, deactivate this again...this will return the activity because the terminating
-        // flag is on.
-        current->exitCurrentThread();
+        // flag is on. Don't nudge the dispatch queue yet
+        current->exitCurrentThread(false);
     }
     // do the release in a catch block to ensure we really release this
     catch (NativeActivation *)
     {
+        // same as above, while we still have kernel access
+        Interpreter::terminateInterpreterInstance(this);
+
         // ok, deactivate this again...this will return the activity because the terminating
-        // flag is on.
-        current->exitCurrentThread();
+        // flag is on. Don't nudge the dispatch queue yet
+        current->exitCurrentThread(false);
 
     }
 
     terminationSem.close();
 
-    // make sure the root activity is removed by the ActivityManager;
-    ActivityManager::returnRootActivity(rootActivity);
+    // make sure the root activity is removed by the ActivityManager (unless
+    // DetachThread() already returned it)
+    if (!rootDetached)
+    {
+        ActivityManager::returnRootActivity(rootActivity);
+    }
 
     // just in case there's still a reference held to this, clear out all object reference fields
     rootActivity = OREF_NULL;
     securityManager = OREF_NULL;
-    allActivities = OREF_NULL;
+    // The resource lock is required here: this instance can still be reached by
+    // the collector. Activities killed by removeInactiveActivities() never run
+    // detachInstance() -- runThread() sees the exit flag and goes straight to
+    // activityEnded() -- so they sit in ActivityManager::allActivities, which is
+    // a permanent root, still pointing at this instance. reset() rather than
+    // clear() because this object never runs a C++ destructor, so clear() would
+    // leak the buffer.
+    {
+        ResourceSection lock;
+        allActivities.reset();
+    }
     defaultEnvironment = OREF_NULL;
     searchPath = OREF_NULL;
     searchExtensions = OREF_NULL;
@@ -559,9 +652,19 @@ bool InterpreterInstance::terminate()
     commandHandlers = OREF_NULL;
     requiresFiles = OREF_NULL;
 
+    // the kernel lock was released by exitCurrentThread() above, also when a
+    // new activity was created for the termination (enterOnCurrentThread()
+    // does not lock it twice any more, bug #1650), so just nudge the dispatch
+    // queue. Nudging the queue requires the dispatch lock. This used to be
+    // done without it, which is an unguarded access to the dispatch queue.
+    // See bug #2072.
+    {
+        DispatchSection lock;
+        ActivityManager::dispatchNext(lock);
+    }
 
-    // tell the main interpreter controller we're gone.
-    Interpreter::terminateInterpreterInstance(this);
+    // NOTE: the interpreter controller was told we are gone above, while this
+    // thread still held kernel access.
     return true;
 }
 
@@ -588,7 +691,7 @@ void InterpreterInstance::removeGlobalReference(RexxObject *o)
 {
     if (o != OREF_NULL)
     {
-        memoryObject.addGlobalReference(o);
+        memoryObject.removeGlobalReference(o);
     }
 }
 
@@ -603,13 +706,15 @@ bool InterpreterInstance::haltAllActivities(RexxString *name)
     ResourceSection lock;
     bool result = true;
 
-    for (size_t listIndex = 1; listIndex <= allActivities->items(); listIndex++)
+    for (size_t listIndex = 1; listIndex <= allActivities.items(); listIndex++)
     {
-        Activity *activity = (Activity *)allActivities->get(listIndex);
-        // only halt the active ones
-        if (activity->isActive())
+        Activity *activity = (Activity *)allActivities.get(listIndex);
+        // only halt the active ones, every one of them, even after one that
+        // could not take it because a halt is already pending there
+        // (result && ... would skip the rest)
+        if (activity->isActive() && !activity->halt(OREF_NULL))
         {
-            result = result && activity->halt(OREF_NULL);
+            result = false;
         }
     }
     return result;
@@ -624,9 +729,9 @@ void InterpreterInstance::traceAllActivities(bool on)
     // make sure we lock this, since it is possible the table can get updated
     // as a result of setting these flags
     ResourceSection lock;
-    for (size_t listIndex = 1; listIndex <= allActivities->items(); listIndex++)
+    for (size_t listIndex = 1; listIndex <= allActivities.items(); listIndex++)
     {
-        Activity *activity = (Activity *)allActivities->get(listIndex);
+        Activity *activity = (Activity *)allActivities.get(listIndex);
         // only tap the active ones
         if (activity->isActive())
         {
@@ -830,6 +935,27 @@ void InterpreterInstance::addCommandHandler(const char *name, REXXPFN entryPoint
 }
 
 /**
+ * Add a native handler on top of the one in use under that name
+ * (StackCommandEnvironment): it covers it, written in Rexx or native, as
+ * .CommandHandler~register covers, and .CommandHandler~deregister uncovers
+ * it again.
+ *
+ * @param name       The name of the address environment this services.
+ * @param entryPoint The entry point address of the handler.
+ * @param type       The category of handler to add.
+ */
+void InterpreterInstance::stackCommandHandler(const char *name, REXXPFN entryPoint, HandlerType::Enum type)
+{
+    Protected<RexxString> handlerName = new_upper_string(name);
+    // resolving first puts a classic subcommand handler not yet used below
+    Protected<CommandHandler> covered = resolveCommandHandler(handlerName);
+    Protected<CommandHandler> entry = new CommandHandler(entryPoint, type);
+    entry->setPrevious(covered);
+    commandHandlers->put(entry, handlerName);
+}
+
+
+/**
  * Add a handler for a registered subcom handler to the
  * address handler list.
  *
@@ -839,13 +965,117 @@ void InterpreterInstance::addCommandHandler(const char *name, REXXPFN entryPoint
  */
 void InterpreterInstance::addCommandHandler(const char *name, const char *registeredName)
 {
-    RexxString *handlerName = new_upper_string(name);
-    CommandHandler *handler = new CommandHandler(registeredName);
+    // look this up first: the lookup releases the kernel lock, so nothing
+    // we create may wait across it unanchored
+    REXXPFN entry = CommandHandler::resolveRegisteredName(registeredName);
     // it's possible we were give a bogus name, so validate this first
-    if (handler->isResolved())
+    if (entry != NULL)
     {
-        commandHandlers->put(handler, handlerName);
+        Protected<RexxString> handlerName = new_upper_string(name);
+        commandHandlers->put(new CommandHandler(entry, HandlerType::REGISTERED_NAME), handlerName);
     }
+}
+
+
+/**
+ * Add a command environment written in Rexx (.CommandHandler~register).
+ * Registrations stack: the new handler covers the one in use under that
+ * name (written in Rexx or native, including a classic subcommand handler
+ * registered through rxapi), and deregister uncovers it.
+ *
+ * @param name    The environment name (not case-sensitive).
+ * @param handler The handler object.
+ *
+ * @return The object of the handler it covers, or OREF_NULL.
+ */
+RexxObject *InterpreterInstance::addCommandHandler(RexxString *name, RexxObject *handler)
+{
+    Protected<RexxString> handlerName = name->upper();
+    // resolving first puts a classic subcommand handler not yet used below
+    Protected<CommandHandler> covered = resolveCommandHandler(handlerName);
+    Protected<CommandHandler> entry = new CommandHandler(handler);
+    entry->setPrevious(covered);
+    commandHandlers->put(entry, handlerName);
+    return covered == OREF_NULL ? OREF_NULL : covered->getRexxObject(handlerName);
+}
+
+
+/**
+ * Remove the command handler in use under a name (.CommandHandler~deregister),
+ * written in Rexx or native, uncovering the one it covered.  When nothing is
+ * left, the name is an unknown environment from then on; for a classic
+ * subcommand handler a marker keeps rxapi from bringing it back in this
+ * instance (rxapi itself is untouched: that is RXSUBCOM DROP's job).
+ *
+ * @param name   The environment name.
+ *
+ * @return The object of the handler removed, or OREF_NULL if there was none.
+ */
+RexxObject *InterpreterInstance::removeCommandHandler(RexxString *name)
+{
+    Protected<RexxString> handlerName = name->upper();
+    Protected<CommandHandler> handler = resolveCommandHandler(handlerName);
+    if (handler == OREF_NULL)
+    {
+        return OREF_NULL;
+    }
+    Protected<RexxObject> removed = handler->getRexxObject(handlerName);
+    CommandHandler *uncovered = handler->getPrevious();
+    if (uncovered != OREF_NULL)
+    {
+        commandHandlers->put(uncovered, handlerName);
+    }
+    else if (handler->isRegisteredName())
+    {
+        commandHandlers->put(new CommandHandler(NULL, HandlerType::UNRESOLVED), handlerName);
+    }
+    else
+    {
+        commandHandlers->remove(handlerName);
+    }
+    return removed;
+}
+
+
+/**
+ * The command environments known to this instance: a StringTable from the
+ * name to the object of the handler in use (written in Rexx, or a
+ * .NativeCommandHandler).
+ *
+ * @return A new StringTable.
+ */
+StringTable *InterpreterInstance::listCommandHandlers()
+{
+    Protected<StringTable> list = new_string_table();
+    for (HashContents::TableIterator iterator = commandHandlers->iterator(); iterator.isAvailable(); iterator.next())
+    {
+        CommandHandler *handler = (CommandHandler *)iterator.value();
+        if (handler->isResolved())
+        {
+            RexxString *handlerName = (RexxString *)iterator.index();
+            list->put(handler->getRexxObject(handlerName), handlerName);
+        }
+    }
+    return list;
+}
+
+
+/**
+ * The handlers stacked under a name, the one in use first.
+ *
+ * @param name   The environment name.
+ *
+ * @return A new Array (empty if there is no such environment).
+ */
+ArrayClass *InterpreterInstance::listCommandHandlerStack(RexxString *name)
+{
+    Protected<RexxString> handlerName = name->upper();
+    Protected<ArrayClass> list = new_array();
+    for (CommandHandler *handler = resolveCommandHandler(handlerName); handler != OREF_NULL; handler = handler->getPrevious())
+    {
+        list->append(handler->getRexxObject(handlerName));
+    }
+    return list;
 }
 
 
@@ -859,16 +1089,30 @@ void InterpreterInstance::addCommandHandler(const char *name, const char *regist
 CommandHandler *InterpreterInstance::resolveCommandHandler(RexxString *name)
 {
     // all names in the cache are in upper case
-    RexxString *upperName = name->upper();
+    Protected<RexxString> upperName = name->upper();
     CommandHandler *handler = (CommandHandler *)commandHandlers->get(upperName);
+    // removed in this instance (deregister of a classic subcommand handler)
+    if (handler != OREF_NULL && !handler->isResolved())
+    {
+        return OREF_NULL;
+    }
     if (handler == OREF_NULL)
     {
-        handler = new CommandHandler(name->getStringData());
-        if (!handler->isResolved())
+        // a classic subcommand handler registered under this name?  The
+        // lookup releases the kernel lock: another thread may add this
+        // environment meanwhile, so look in the table again before adding
+        // one of our own (which would replace it).
+        REXXPFN entry = CommandHandler::resolveRegisteredName(name->getStringData());
+        handler = (CommandHandler *)commandHandlers->get(upperName);
+        if (handler == OREF_NULL)
         {
-            return OREF_NULL;   // can't find this
+            if (entry == NULL)
+            {
+                return OREF_NULL;   // can't find this
+            }
+            handler = new CommandHandler(entry, HandlerType::REGISTERED_NAME);
+            commandHandlers->put(handler, upperName);
         }
-        commandHandlers->put(handler, upperName);
     }
     return handler;
 }

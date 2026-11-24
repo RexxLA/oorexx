@@ -49,6 +49,28 @@
 
 class RexxBlockInstruction;
 class RexxVariableBase;
+class RexxInstructionCatch;
+class RexxInstruction;
+
+/**
+ * What goes on when the code of a FINALLY clause reaches the END of
+ * its block: the reason control was leaving the block (RFE #31).
+ */
+typedef enum
+{
+    FINALLY_NONE,          // the code of the clause is not running
+    FINALLY_END,           // the block ended by itself: go on after the END
+    FINALLY_LEAVE,         // LEAVE of an outer block
+    FINALLY_ITERATE,       // ITERATE of an outer loop
+    FINALLY_RETURN,        // RETURN
+    FINALLY_EXIT,          // EXIT
+    FINALLY_SIGNAL,        // SIGNAL instruction
+    FINALLY_SIGNAL_TRAP,   // a SIGNAL ON trap
+    FINALLY_CATCH,         // a condition caught by a CATCH clause of an outer block
+    FINALLY_CONDITION,     // a condition that goes out of this activation
+    FINALLY_RAISE,         // RAISE ... RETURN
+    FINALLY_RAISE_EXIT,    // RAISE ... EXIT
+} FinallyAction;
 
 /**
  * A container for state of active block instructions (DO LOOP, or SELECT)
@@ -87,6 +109,35 @@ class DoBlock : public RexxInternalObject
     inline void newIteration() { counter++; };
     void setCounter(RexxActivation *context);
 
+    // CATCH clauses (RFE #31)
+    inline void setCatches(RexxInstructionCatch *c) { catches = c; }
+    inline RexxInstructionCatch *getCatches() { return catches; }
+    inline void setInCatch(bool v) { inCatch = v; }
+    inline bool isInCatch() { return inCatch; }
+    inline void setNest(size_t n) { nest = n; }
+    inline size_t getNest() { return nest; }
+
+    // FINALLY clause
+    inline RexxInstructionCatch *getFinally() { return finallyClause; }
+    inline void setFinally(RexxInstructionCatch *c) { finallyClause = c; }
+    inline bool isInFinally() { return inFinally; }
+    inline void setInFinally(bool v) { inFinally = v; }
+    // the block has a FINALLY clause that has not started yet
+    inline bool hasFinallyToRun() { return finallyClause != OREF_NULL && !inFinally; }
+    inline void setPending(FinallyAction a, RexxInternalObject *o, RexxInstruction *i, DoBlock *b, RexxInstruction *c)
+    {
+        pendingAction = a;
+        pendingObject = o;
+        pendingInstruction = i;
+        pendingBlock = b;
+        pendingCurrent = c;
+    }
+    inline FinallyAction getPendingAction() { return pendingAction; }
+    inline RexxInternalObject *getPendingObject() { return pendingObject; }
+    inline RexxInstruction *getPendingInstruction() { return pendingInstruction; }
+    inline DoBlock *getPendingBlock() { return pendingBlock; }
+    inline RexxInstruction *getPendingCurrent() { return pendingCurrent; }
+
 
 protected:
 
@@ -105,5 +156,17 @@ protected:
     TokenSubclass      compare;          // type of comparison
     RexxVariableBase  *countVariable;    // control variable for counter
     uint64_t           counter;          // the loop iteration counter
+
+    RexxInstructionCatch *catches;       // first CATCH clause of the block, if any
+    bool               inCatch;          // the code of a CATCH clause is running
+    size_t             nest;             // block nesting level of the block's body
+
+    RexxInstructionCatch *finallyClause; // FINALLY clause of the block, if any
+    bool               inFinally;        // the code of the FINALLY clause is running
+    FinallyAction      pendingAction;    // what goes on when that code reaches the END...
+    RexxInternalObject *pendingObject;   // ...a result, a block name, a condition object
+    RexxInstruction   *pendingInstruction; // ...a SIGNAL target, a CATCH clause
+    DoBlock           *pendingBlock;     // ...the block of that CATCH clause
+    RexxInstruction   *pendingCurrent;   // ...and the instruction that was leaving the block
 };
 #endif

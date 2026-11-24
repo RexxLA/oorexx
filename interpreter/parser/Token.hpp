@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -255,6 +255,9 @@ typedef enum
     KEYWORD_REQUIRES,
     KEYWORD_USE_LOCAL,
     KEYWORD_CONSTANT,
+    KEYWORD_CATCH,
+    KEYWORD_FINALLY,
+    KEYWORD_THROW,
 } InstructionKeyword;
 
 // instruction subkeyword types
@@ -322,6 +325,8 @@ typedef enum
     SUBKEY_NORMAL,
     SUBKEY_APPEND,
     SUBKEY_REPLACE,
+    SUBKEY_NOINHERIT,
+    SUBKEY_INHERIT,
 } InstructionSubKeyword;
 
 
@@ -400,6 +405,7 @@ typedef enum
     SUBDIRECTIVE_LOSTDIGITS,
     SUBDIRECTIVE_NOSTRING,
     SUBDIRECTIVE_NOTREADY,
+    SUBDIRECTIVE_NUMERIC,
 } DirectiveSubKeyword;
 
 
@@ -508,6 +514,12 @@ typedef enum
     BUILTIN_ENDLOCAL,
     BUILTIN_SETLOCAL,
     BUILTIN_QUALIFY,
+    BUILTIN_GC,
+    // new in 5.3.0: these three used to be routines of the REXX package;
+    // they go at the end, because compiled programs store these codes
+    BUILTIN_BEEP,
+    BUILTIN_DIRECTORY,
+    BUILTIN_FILESPEC,
 } BuiltinCode;
 
 

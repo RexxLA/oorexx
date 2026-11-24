@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -49,9 +49,6 @@
 
 RexxString *Interpreter::versionNumber = OREF_NULL;
 
-const char *Interpreter::languageLevel = "6.05";
-
-
 /**
  * Generate a version number string for the interpreter.
  *
@@ -64,7 +61,7 @@ RexxString *Interpreter::getVersionString()
         char     buffer[100];                /* buffer for building the string    */
         char     work[20];                   /* working buffer                    */
 
-        strcpy(work, __DATE__);              /* copy the build date               */
+        strcpy(work, getBuildDate());        /* copy the build date               */
         char *month = strtok(work, " ");     /* get the month                     */
         char *day = strtok(NULL, " ");       /* get the build day                 */
         char *year = strtok(NULL, " ");      /* and the year                      */
@@ -79,10 +76,25 @@ RexxString *Interpreter::getVersionString()
 #else
                         "32",
 #endif
-                        languageLevel, day, month, year);
+                        Interpreter::getLanguageLevelString(), day, month, year);
         versionNumber = new_string(buffer);  /* return as a rexx string           */
     }
     return versionNumber;
+}
+
+
+/**
+ * Return the date the interpreter was built, as the compiler gives it
+ * ("Mmm dd yyyy").  This is the only place where __DATE__ is used, so that
+ * everything that reports the build date (the version string, .RexxInfo~date
+ * and RexxGetVersionInformation) agrees, even when the build spans midnight
+ * (bugs #1813 and #2051).
+ *
+ * @return The build date.
+ */
+const char *Interpreter::getBuildDate()
+{
+    return __DATE__;
 }
 
 

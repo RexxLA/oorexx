@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2019 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -330,7 +330,16 @@ RexxObject *RexxString::dataType(RexxString *pType)
     // if the type was specified, get the option character and perform the check
     if (pType != OREF_NULL)
     {
-        int type = optionalOptionArgument(pType, 0, ARG_ONE);
+        // a null string has no option character to report: report the
+        // value as given, as the other built-in functions do
+        RexxString *typeString = stringArgument(pType, ARG_ONE);
+        if (typeString->isNullString())
+        {
+            // the type is the method's argument 1 (DATATYPE's argument 2)
+            builtinOptionError(1, "ABILMNOSUVWX9", typeString);
+            reportException(Error_Incorrect_method_option, "ABILMNOSUVWX9", typeString);
+        }
+        int type = optionArgument(typeString, ARG_ONE);
         return StringUtil::dataType(this, type);
     }
 
@@ -684,6 +693,10 @@ RexxString *RexxString::translate(RexxString *tableo, RexxString *tablei, RexxSt
     // if there are no input or output table specified, and no pad, this is just an uppercase.
     if (tableo == OREF_NULL && tablei == OREF_NULL && pad == OREF_NULL)
     {
+        // check start and range as translate's arguments 4 and 5 first: for
+        // upper they would be arguments 1 and 2
+        optionalPositionArgument(_start, 1, ARG_FOUR);
+        optionalLengthArgument(_range, 0, ARG_FIVE);
         return upperRexx(_start, _range);
     }
 

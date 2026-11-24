@@ -134,6 +134,15 @@ optional for the subcodes.
         <SymbolicName>Error_Program_interrupted_user_defined</SymbolicName>
         <Text><Sub position="1" name="message"/>.</Text>
       </SubMessage>
+      <SubMessage>
+        <Code>4</Code>
+        <Subcode>901</Subcode>
+        <MessageNumber>867</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Program_interrupted_condition_description</SymbolicName>
+        <Text>Program interrupted with <Sub position="1" name="condition"/> condition: <Sub position="2" name="description"/>.</Text>
+      </SubMessage>
     </Subcodes>
   </Message>
   <Message>
@@ -380,7 +389,7 @@ else                    end
         <Component>Rexx</Component>
         <Severity>Warning</Severity>
         <SymbolicName>Error_Unexpected_end_nocontrol</SymbolicName>
-        <Text>END corresponding to block on line <Sub position="2" name="symbol"/> must not have a symbol following it because there is no LABEL or control variable; found <q><Sub position="1" name="line_number"/></q>.</Text>
+        <Text>END corresponding to block on line <Sub position="2" name="line_number"/> must not have a symbol following it because there is no LABEL or control variable; found <q><Sub position="1" name="symbol"/></q>.</Text>
       </SubMessage>
       <SubMessage>
         <Code>10</Code>
@@ -416,7 +425,70 @@ else                    end
         <Component>Rexx</Component>
         <Severity>Warning</Severity>
         <SymbolicName>Error_Unexpected_end_select_nolabel</SymbolicName>
-        <Text>END corresponding to SELECT on line <Sub position="2" name="symbol"/> must not have a symbol following it because there is no LABEL; found <q><Sub position="1" name="line_number"/></q>.</Text>
+        <Text>END corresponding to SELECT on line <Sub position="2" name="line_number"/> must not have a symbol following it because there is no LABEL; found <q><Sub position="1" name="symbol"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>10</Code>
+        <Subcode>008</Subcode>
+        <MessageNumber>846</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Unexpected_end_catch</SymbolicName>
+        <Text>CATCH has no corresponding DO, LOOP, or SELECT.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>10</Code>
+        <Subcode>009</Subcode>
+        <MessageNumber>851</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Unexpected_end_catch_then</SymbolicName>
+        <Text>CATCH must not immediately follow THEN.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>10</Code>
+        <Subcode>011</Subcode>
+        <MessageNumber>852</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Unexpected_end_catch_else</SymbolicName>
+        <Text>CATCH must not immediately follow ELSE.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>10</Code>
+        <Subcode>012</Subcode>
+        <MessageNumber>854</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Unexpected_end_finally</SymbolicName>
+        <Text>FINALLY has no corresponding DO, LOOP, or SELECT.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>10</Code>
+        <Subcode>013</Subcode>
+        <MessageNumber>855</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Unexpected_end_finally_then</SymbolicName>
+        <Text>FINALLY must not immediately follow THEN.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>10</Code>
+        <Subcode>014</Subcode>
+        <MessageNumber>856</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Unexpected_end_finally_else</SymbolicName>
+        <Text>FINALLY must not immediately follow ELSE.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>10</Code>
+        <Subcode>015</Subcode>
+        <MessageNumber>857</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Unexpected_end_after_finally</SymbolicName>
+        <Text>A CATCH or FINALLY clause must not follow the FINALLY clause on line <Sub position="1" name="line_number"/>.</Text>
       </SubMessage>
     </Subcodes>
   </Message>
@@ -430,8 +502,7 @@ else                    end
     <Text>Control stack full.</Text>
     <Explanation><para>The available stack space has been exhausted.
       This could be because of a looping INTERPRET instruction, such as:</para>
-<programlisting>
-line = 'INTERPRET line'
+<programlisting language="rexx">line = 'INTERPRET line'
 INTERPRET line
 </programlisting>
       <para>The INTERPRET instruction loops until all available stack space has been exhausted.
@@ -590,16 +661,14 @@ editbin rexx.exe /stack:100000000
     <SymbolicName>Error_Invalid_hex</SymbolicName>
     <Text>Invalid hexadecimal or binary string.</Text>
     <Explanation><para>Hexadecimal strings must not have leading or trailing whitespace characters and whitespace can only be embedded at byte boundaries.  Only the digits 0-9 and the letters a-f and A-F are allowed.  The following are valid hexadecimal strings: </para>
-<programlisting>
-'13'x
+<programlisting language="rexx">'13'x
 'A3C2 1c34'x
 '1de8'x
 </programlisting>
     <para>Binary strings must not have leading or trailing whitespace characters and whitespace can only be embedded at the boundaries of groups of four binary digits.
     Only the digits 0 and 1 are allowed.
     These are valid binary strings:</para>
-<programlisting>
-'1011'b
+<programlisting language="rexx">'1011'b
 '110 1101'b
 '101101 11010011'b
 </programlisting>
@@ -1354,6 +1423,33 @@ editbin rexx.exe /stack:100000000
         <SymbolicName>Error_Symbol_expected_counter</SymbolicName>
         <Text>Symbol expected after COUNTER keyword.</Text>
       </SubMessage>
+      <SubMessage>
+        <Code>20</Code>
+        <Subcode>935</Subcode>
+        <MessageNumber>839</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Symbol_expected_numeric_subdirective</SymbolicName>
+        <Text>Symbol expected after the NUMERIC subdirective keyword.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>20</Code>
+        <Subcode>936</Subcode>
+        <MessageNumber>847</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Symbol_expected_catch</SymbolicName>
+        <Text>Symbol expected after CATCH keyword or after a comma in a CATCH clause.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>20</Code>
+        <Subcode>937</Subcode>
+        <MessageNumber>862</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Symbol_expected_throw</SymbolicName>
+        <Text>Symbol expected after THROW keyword.</Text>
+      </SubMessage>
     </Subcodes>
   </Message>
   <Message>
@@ -1653,7 +1749,7 @@ editbin rexx.exe /stack:100000000
         <Component>Rexx</Component>
         <Severity>Warning</Severity>
         <SymbolicName>Error_Invalid_subkeyword_form</SymbolicName>
-        <Text>NUMERIC FORM must be followed by one of the keywords SCIENTIFIC or ENGINEERING; found <q><Sub position="1" name="word"/></q>.</Text>
+        <Text>NUMERIC FORM must be followed by SCIENTIFIC, ENGINEERING, VALUE, or an expression whose value is SCIENTIFIC or ENGINEERING; found <q><Sub position="1" name="word"/></q>.</Text>
       </SubMessage>
       <SubMessage>
         <Code>25</Code>
@@ -1979,6 +2075,69 @@ editbin rexx.exe /stack:100000000
         <SymbolicName>Error_Invalid_subkeyword_address_with_option</SymbolicName>
         <Text>WITH must be followed by one of the keywords INPUT, OUTPUT, or ERROR; found <q><Sub position="1" name="word"/></q>.</Text>
       </SubMessage>
+      <SubMessage>
+        <Code>25</Code>
+        <Subcode>935</Subcode>
+        <MessageNumber>840</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_subkeyword_numeric_subdirective</SymbolicName>
+        <Text>Subdirective NUMERIC must be followed by one of the keywords INHERIT or NOINHERIT; found <q><Sub position="1" name="word"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>25</Code>
+        <Subcode>936</Subcode>
+        <MessageNumber>841</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_subkeyword_duplicate</SymbolicName>
+        <Text>Duplicate keyword on ::<Sub position="1" name="directive"/> directive; found <q><Sub position="2" name="keyword"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>25</Code>
+        <Subcode>937</Subcode>
+        <MessageNumber>842</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_subkeyword_conflict</SymbolicName>
+        <Text>Keyword <q><Sub position="1" name="keyword"/></q> on ::<Sub position="2" name="directive"/> directive conflicts with <q><Sub position="3" name="word"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>25</Code>
+        <Subcode>938</Subcode>
+        <MessageNumber>843</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_subkeyword_options_form</SymbolicName>
+        <Text>FORM must be followed by one of the keywords SCIENTIFIC or ENGINEERING; found <q><Sub position="1" name="word"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>25</Code>
+        <Subcode>939</Subcode>
+        <MessageNumber>848</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_subkeyword_catch</SymbolicName>
+        <Text>CATCH must be followed by one or more of the keywords ERROR, FAILURE, HALT, LOSTDIGITS, NOTREADY, NOMETHOD, NOSTRING, NOVALUE, SYNTAX, USER, or ANY, separated by commas; found <q><Sub position="1" name="word"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>25</Code>
+        <Subcode>940</Subcode>
+        <MessageNumber>863</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_subkeyword_throw</SymbolicName>
+        <Text>THROW must be followed by one of the keywords ERROR, FAILURE, HALT, LOSTDIGITS, NOMETHOD, NOSTRING, NOTREADY, NOVALUE, PROPAGATE, SYNTAX, or USER; found <q><Sub position="1" name="word"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>25</Code>
+        <Subcode>941</Subcode>
+        <MessageNumber>864</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_subkeyword_throwoption</SymbolicName>
+        <Text>Unknown keyword on THROW instruction; found <q><Sub position="1" name="word"/></q>.</Text>
+      </SubMessage>
     </Subcodes>
   </Message>
   <Message>
@@ -2253,6 +2412,24 @@ editbin rexx.exe /stack:100000000
         <SymbolicName>Error_Invalid_leave_iterate_name</SymbolicName>
         <Text>Symbol following ITERATE (<q><Sub position="1" name="symbol"/></q>) does not match a repetitive block instruction.</Text>
       </SubMessage>
+      <SubMessage>
+        <Code>28</Code>
+        <Subcode>006</Subcode>
+        <MessageNumber>849</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_leave_leave_catch</SymbolicName>
+        <Text>LEAVE in a CATCH clause must not refer to the block instruction on line <Sub position="1" name="line_number"/>, which owns the clause.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>28</Code>
+        <Subcode>007</Subcode>
+        <MessageNumber>850</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_leave_iterate_catch</SymbolicName>
+        <Text>ITERATE in a CATCH clause must not refer to the block instruction on line <Sub position="1" name="line_number"/>, which owns the clause.</Text>
+      </SubMessage>
     </Subcodes>
   </Message>
   <Message>
@@ -2426,6 +2603,15 @@ editbin rexx.exe /stack:100000000
         <Severity>Warning</Severity>
         <SymbolicName>Error_Expression_result_raise</SymbolicName>
         <Text>Incorrect expression result following SYNTAX keyword of RAISE instruction.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>33</Code>
+        <Subcode>905</Subcode>
+        <MessageNumber>868</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Expression_result_throw</SymbolicName>
+        <Text>Incorrect expression result following SYNTAX keyword of THROW instruction.</Text>
       </SubMessage>
     </Subcodes>
   </Message>
@@ -2901,6 +3087,33 @@ editbin rexx.exe /stack:100000000
         <SymbolicName>Error_Invalid_expression_missing_constant</SymbolicName>
         <Text>Missing expression on ::CONSTANT directive.</Text>
       </SubMessage>
+      <SubMessage>
+        <Code>35</Code>
+        <Subcode>937</Subcode>
+        <MessageNumber>853</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_expression_catch_syntax</SymbolicName>
+        <Text>Incorrect error number following SYNTAX keyword of CATCH clause; found <q><Sub position="1" name="value"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>35</Code>
+        <Subcode>938</Subcode>
+        <MessageNumber>865</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_expression_throw_description</SymbolicName>
+        <Text>Missing expression following DESCRIPTION keyword of a THROW instruction.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>35</Code>
+        <Subcode>939</Subcode>
+        <MessageNumber>866</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Invalid_expression_throw_additional</SymbolicName>
+        <Text>Missing expression following ADDITIONAL keyword of a THROW instruction.</Text>
+      </SubMessage>
     </Subcodes>
   </Message>
   <Message>
@@ -2955,8 +3168,7 @@ editbin rexx.exe /stack:100000000
 Say Enter A, B, or C
 </programlisting>
     <para>as follows:</para>
-<programlisting>
-Say 'Enter A, B, or C'
+<programlisting language="rexx">Say 'Enter A, B, or C'
 </programlisting>
     </Explanation>
     <Subcodes>
@@ -3477,6 +3689,24 @@ Say 'Enter A, B, or C'
         <SymbolicName>Error_Incorrect_call_noarray_nostem</SymbolicName>
         <Text>Argument <Sub position="1" name="argument"/> must be an array object, a stem object, or a stem name value; found <q><Sub position="2" name="value"/></q>.</Text>
       </SubMessage>
+      <SubMessage>
+        <Code>40</Code>
+        <Subcode>926</Subcode>
+        <MessageNumber>845</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Incorrect_call_error_code</SymbolicName>
+        <Text><Sub position="1" name="function_name"/> argument <Sub position="2" name="argument_number"/> must be an error code nn.nnn, with nn in the range 0-99 and nnn in the range 0-999; found <q><Sub position="3" name="value"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>40</Code>
+        <Subcode>927</Subcode>
+        <MessageNumber>860</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Incorrect_call_range_limits</SymbolicName>
+        <Text><Sub position="1" name="function_name"/> argument <Sub position="2" name="argument_number"/> must be in the range <Sub position="3" name="minimum"/> to <Sub position="4" name="maximum"/>; found <q><Sub position="5" name="value"/></q>.</Text>
+      </SubMessage>
     </Subcodes>
   </Message>
   <Message>
@@ -3561,6 +3791,15 @@ Say 'Enter A, B, or C'
         <Severity>Warning</Severity>
         <SymbolicName>Error_Conversion_raise</SymbolicName>
         <Text>Value of RAISE instruction SYNTAX expression must be numeric; found <q><Sub position="1" name="value"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>41</Code>
+        <Subcode>902</Subcode>
+        <MessageNumber>869</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Conversion_throw</SymbolicName>
+        <Text>Value of THROW instruction SYNTAX expression must be numeric; found <q><Sub position="1" name="value"/></q>.</Text>
       </SubMessage>
     </Subcodes>
   </Message>
@@ -3792,6 +4031,15 @@ Say 'Enter A, B, or C'
         <Severity>Warning</Severity>
         <SymbolicName>Error_Variable_reference_use</SymbolicName>
         <Text>Extra token (<q><Sub position="1" name="token"/></q>) found in USE ARG variable reference; <q>,</q> or end of instruction expected.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>46</Code>
+        <Subcode>903</Subcode>
+        <MessageNumber>844</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Variable_reference_use_default</SymbolicName>
+        <Text>Extra token (<q><Sub position="1" name="token"/></q>) found in USE ARG name; <q>,</q>, <q>=</q> or end of instruction expected.</Text>
       </SubMessage>
     </Subcodes>
   </Message>
@@ -5463,6 +5711,15 @@ Say 'Enter A, B, or C'
       </SubMessage>
       <SubMessage>
         <Code>98</Code>
+        <Subcode>940</Subcode>
+        <MessageNumber>870</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Execution_error_condition_throw</SymbolicName>
+        <Text>Unknown error number specified on THROW SYNTAX; found <q><Sub position="1" name="number"/></q>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>98</Code>
         <Subcode>941</Subcode>
         <MessageNumber>505</MessageNumber>
         <Component>Rexx</Component>
@@ -5550,6 +5807,15 @@ Say 'Enter A, B, or C'
         <Severity>Warning</Severity>
         <SymbolicName>Error_Execution_circular_requires</SymbolicName>
         <Text>Circular ::REQUIRES references detected with <Sub position="1" name="name"/>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>98</Code>
+        <Subcode>953</Subcode>
+        <MessageNumber>858</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Execution_finally_exit</SymbolicName>
+        <Text><Sub position="1" name="instruction"/> must not leave the FINALLY clause on line <Sub position="2" name="line_number"/>.</Text>
       </SubMessage>
       <SubMessage>
         <Code>98</Code>
@@ -6278,6 +6544,24 @@ Say 'Enter A, B, or C'
         <Severity>Warning</Severity>
         <SymbolicName>Error_Translation_use_arg_reference_no_default</SymbolicName>
         <Text>A USE ARG default value is not allowed for variable references.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>99</Code>
+        <Subcode>951</Subcode>
+        <MessageNumber>859</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Translation_finally_exit</SymbolicName>
+        <Text><Sub position="1" name="instruction"/> must not leave the FINALLY clause on line <Sub position="2" name="line_number"/>.</Text>
+      </SubMessage>
+      <SubMessage>
+        <Code>99</Code>
+        <Subcode>952</Subcode>
+        <MessageNumber>861</MessageNumber>
+        <Component>Rexx</Component>
+        <Severity>Warning</Severity>
+        <SymbolicName>Error_Translation_forward_finally</SymbolicName>
+        <Text>FORWARD without CONTINUE on line <Sub position="1" name="line_number"/> must not be in a block with a FINALLY clause.</Text>
       </SubMessage>
     </Subcodes>
   </Message>

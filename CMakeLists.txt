@@ -1,6 +1,6 @@
 #/*----------------------------------------------------------------------------*/
 #/*                                                                            */
-#/* Copyright (c) 2014-2025 Rexx Language Association. All rights reserved.    */
+#/* Copyright (c) 2014-2026 Rexx Language Association. All rights reserved.    */
 #/*                                                                            */
 #/* This program and the accompanying materials are made available under       */
 #/* the terms of the Common Public License v1.0 which accompanies this         */
@@ -52,6 +52,15 @@ else ()
     cmake_minimum_required (VERSION 2.8.12...99.99)
 endif ()
 
+# CMP0069 must be NEW before check_ipo_supported() will run at all: under OLD it
+# only ever adds IPO flags for the Intel compiler on Linux, and the check itself
+# raises a fatal error. See the IPO block further down. The policy and the
+# CheckIPOSupported module both arrived in CMake 3.9, so guard for older CMake
+# (e.g. 3.5 on Ubuntu 16.04), which does not know the policy and errors on it.
+if (POLICY CMP0069)
+  cmake_policy(SET CMP0069 NEW)
+endif ()
+
 # must come before the project command
 # 10.13.6 High Sierra is the minimum system supported
 if( APPLE AND BUILD_OSX_UNIVERSAL_BINARIES )
@@ -82,7 +91,7 @@ set (CMAKE_SAMPLES_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/samples)
 # The version of ooRexx to make
 set (ORX_API_LEVEL 4)
 set (ORX_MAJOR 5)
-set (ORX_MINOR 2)
+set (ORX_MINOR 3)
 set (ORX_MOD_LVL 0)
 set (ORX_BLD_LVL 0)
 set (ORX_VERSION ${ORX_MAJOR}.${ORX_MINOR}.${ORX_MOD_LVL})
@@ -146,11 +155,9 @@ endif()
 endif()
 message(STATUS "Revision Number is ${ORX_BLD_LVL}")
 
-if (WIN32)
-# find a xalan executable, but only on windows for now.
-    FIND_PROGRAM(XALAN_EXECUTABLE xalan
-       DOC "xalan command line xslt converter")
-endif()
+FIND_PROGRAM(XALAN_EXECUTABLE Xalan
+   DOC "Xalan command line xslt converter")
+message(STATUS "XALAN_EXECUTABLE is ${XALAN_EXECUTABLE}")
 
 # The following supports the versioning of the rexx shared libraries
 # This defines the oorexx library version. For ooRexx this should always be the
@@ -266,7 +273,7 @@ else ()
    set (CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
 
    if (APPLE)
-       SET (CMAKE_INSTALL_RPATH "@executable_path/../lib")
+       SET (CMAKE_INSTALL_RPATH "@executable_path/../lib;@executable_path/../Libraries")
    else ()
        # using $ORIGIN/.. instead of ${CMAKE_INSTALL_PREFIX} allows the package
        # to be relocated during installation, but this comes at a cost: we can't
@@ -306,6 +313,52 @@ if (CMAKE_VERSION VERSION_LESS "3.1")
   endif ()
 else ()
   set (CMAKE_CXX_STANDARD 11)
+  if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-lifetime-dse")
+  endif ()
+endif ()
+
+# Interprocedural optimization, also known as link time optimization.
+#
+# This was enabled once before, in r13047, and reverted ten days later in r13049
+# because release builds segfaulted on Linux while running the test suite: the
+# reported failure was in Alarm.testGroup, it moved around from run to run, and
+# macOS and Windows were unaffected. A non-deterministic crash that changes
+# location is what latent undefined behaviour looks like once the optimiser is
+# allowed to inline across translation units, so it is worth trying again now
+# that a few such defects have been found and fixed rather than assuming IPO
+# itself is at fault.
+#
+# ORX_ENABLE_IPO exists so that turning this off is a matter of flipping a
+# default rather than deleting the block again. Whoever needs it off next should
+# not have to write a revert.
+option (ORX_ENABLE_IPO "Use interprocedural optimization when the compiler supports it" ON)
+
+if (ORX_ENABLE_IPO AND NOT CMAKE_VERSION VERSION_LESS "3.9")
+  include (CheckIPOSupported)
+  check_ipo_supported (RESULT ipo_supported OUTPUT ipo_output)
+  if (ipo_supported)
+    # A Debug build wants to be debuggable, and cross-module inlining is the
+    # opposite of that.
+    if (CMAKE_BUILD_TYPE STREQUAL "Debug")
+      message (STATUS "IPO is supported but is not used for a Debug build")
+      set (CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+    else ()
+      message (STATUS "IPO is supported and enabled")
+      set (CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
+    endif ()
+  else ()
+    message (STATUS "IPO is not supported by this toolchain: ${ipo_output}")
+    set (CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+  endif ()
+elseif (ORX_ENABLE_IPO)
+  # CheckIPOSupported and policy CMP0069 both require CMake 3.9. Older CMake
+  # (e.g. 3.5 on Ubuntu 16.04) cannot detect or enable IPO, so build without it.
+  message (STATUS "IPO requested but requires CMake 3.9 or later; this is ${CMAKE_VERSION}, building without IPO")
+  set (CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
+else ()
+  message (STATUS "IPO disabled by ORX_ENABLE_IPO")
+  set (CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 endif ()
 
 include_directories(${PROJECT_BINARY_DIR})
@@ -445,6 +498,7 @@ if (NOT WIN32) # Unix header files, libraries, and functions
   check_symbol_exists(KERN_PROC_ARGV "sys/types.h;sys/sysctl.h" HAVE_KERN_PROC_ARGV)
   check_struct_has_member("struct stat" st_mtim sys/stat.h HAVE_STAT_ST_MTIM)
   check_struct_has_member("struct stat" st_mtimespec sys/stat.h HAVE_STAT_ST_MTIMESPEC)
+  check_struct_has_member("struct tm" tm_gmtoff time.h HAVE_TM_GMTOFF)
 
   message(STATUS "-- determine available pragmas --")
   check_c_source_compiles("void main() {
@@ -493,7 +547,10 @@ set (build_extensions_dir extensions)
 set (build_extensions_platform_dir ${build_extensions_dir}/${ORX_PLATFORM_DIR})
 set (build_extensions_rxftp_dir ${build_extensions_dir}/rxftp)
 set (build_extensions_csvstream_dir ${build_extensions_dir}/csvStream)
+set (build_extensions_logicalwrapper_dir ${build_extensions_dir}/logicalwrapper)
 set (build_extensions_json_dir ${build_extensions_dir}/json)
+set (build_extensions_yaml_dir ${build_extensions_dir}/yaml)
+set (build_extensions_parser_dir ${build_extensions_dir}/parser)
 set (build_extensions_dateparser_dir ${build_extensions_dir}/dateparser)
 set (build_extensions_rxmath_dir ${build_extensions_dir}/rxmath)
 set (build_extensions_rxregexp_dir ${build_extensions_dir}/rxregexp)
@@ -538,9 +595,11 @@ set(CompilerFlags
         CMAKE_CXX_FLAGS
         CMAKE_CXX_FLAGS_DEBUG
         CMAKE_CXX_FLAGS_RELEASE
+        CMAKE_CXX_FLAGS_RELWITHDEBINFO
         CMAKE_C_FLAGS
         CMAKE_C_FLAGS_DEBUG
         CMAKE_C_FLAGS_RELEASE
+        CMAKE_C_FLAGS_RELWITHDEBINFO
         )
 foreach(CompilerFlag ${CompilerFlags})
   string(REPLACE "/MD" "/MT" ${CompilerFlag} "${${CompilerFlag}}")
@@ -639,6 +698,14 @@ install(TARGETS rexxapi RUNTIME DESTINATION ${INSTALL_LIB_DIR} COMPONENT Core
 set_target_properties(rexxapi PROPERTIES SOVERSION ${ORX_API_LEVEL})
 create_install_symlink(rexxapi)
 
+##################### utf8proc ###########################
+
+if (WIN32)
+    # To avoid warning LNK4217
+    add_definitions(/DUTF8PROC_STATIC)
+endif ()
+
+
 #################### librexx.so ##########################
 # Sources for librexx.so
 set (interpreter_api_sources ${build_interpreter_api_dir}/CallContextStubs.cpp
@@ -654,7 +721,8 @@ set (classes_support_sources ${build_classes_support_dir}/HashCollection.cpp
             ${build_classes_support_dir}/CompoundVariableTable.cpp
             ${build_classes_support_dir}/CompoundVariableTail.cpp
             ${build_classes_support_dir}/RexxDateTime.cpp
-            ${build_classes_support_dir}/StringUtil.cpp)
+            ${build_classes_support_dir}/StringUtil.cpp
+            ${build_classes_support_dir}/Unicode/utf8proc/utf8proc.c)
 set (classes_sources ${build_classes_dir}/ArrayClass.cpp
             ${build_classes_dir}/BagClass.cpp
             ${build_classes_dir}/BufferClass.cpp
@@ -803,6 +871,8 @@ set (instructions_sources  ${build_instructions_dir}/AddressInstruction.cpp
             ${build_instructions_dir}/NumericInstruction.cpp
             ${build_instructions_dir}/OptionsInstruction.cpp
             ${build_instructions_dir}/OtherwiseInstruction.cpp
+            ${build_instructions_dir}/CatchInstruction.cpp
+            ${build_instructions_dir}/FinallyInstruction.cpp
             ${build_instructions_dir}/ParseInstruction.cpp
             ${build_instructions_dir}/ParseTarget.cpp
             ${build_instructions_dir}/ParseTrigger.cpp
@@ -917,6 +987,16 @@ target_include_directories(rexx PUBLIC
 
 # Extra link library definitions
 target_link_libraries(rexx rexxapi ${platform_interpreter_libs} ${CMAKE_REQUIRED_LIBRARIES})
+if (CMAKE_INTERPROCEDURAL_OPTIMIZATION)
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        if (CMAKE_VERSION VERSION_LESS "3.13")
+            message(STATUS "CMake 3.13 or later is required for target_link_options")
+            message(STATUS "Not disabling lto-wrapper warning: writing 1 byte into a region of size 0")
+        else ()
+            target_link_options (rexx PRIVATE -Wno-stringop-overflow)
+        endif ()
+    endif ()
+endif ()
 install(TARGETS rexx RUNTIME DESTINATION ${INSTALL_LIB_DIR} COMPONENT Core
                      LIBRARY DESTINATION ${INSTALL_LIB_DIR} COMPONENT Core
                      ARCHIVE DESTINATION ${INSTALL_INCLUDE_DIR} COMPONENT DevLib)
@@ -959,7 +1039,7 @@ target_link_libraries(rexx_exe rexx rexxapi ${CMAKE_REQUIRED_LIBRARIES})
 # Merge in extra manifestinformation on Windows
 if (WIN32)
 add_custom_command(TARGET rexx_exe POST_BUILD
-   DEPENDS ${EXE_MANIFEST_FILE}
+   # DEPENDS ${EXE_MANIFEST_FILE}
    COMMAND "mt.exe" -nologo -manifest \"${EXE_MANIFEST_FILE}\" "-inputresource:bin\\rexx.exe;#1" "-outputresource:bin\\rexx.exe;#1"
    COMMENT "Adding custom manifest to rexx.exe...")
 endif ()
@@ -969,7 +1049,8 @@ install(TARGETS rexx_exe RUNTIME COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE
 #################### rexximage (bin file) ##########################
 # These are the core classes built into the .img file.
 set (core_classes ${build_rexx_classes_dir}/CoreClasses.orx
-            ${build_rexx_classes_dir}/StreamClasses.orx)
+            ${build_rexx_classes_dir}/StreamClasses.orx
+            ${build_rexx_classes_dir}/CommandClasses.orx)
 # additional source files required by specific platforms
 if (WIN32)
    set (platform_rexximage_sources ${build_platform_dir}/verinfo.rc)
@@ -1013,12 +1094,14 @@ endmacro (configure_build_file)
 # Copy the class files to the build directory
 copy_build_file(CoreClasses.orx ${build_rexx_classes_dir})
 copy_build_file(StreamClasses.orx ${build_rexx_classes_dir})
+copy_build_file(CommandClasses.orx ${build_rexx_classes_dir})
 copy_build_file(PlatformObjects.orx ${build_interpreter_platform_dir})
 
 # These are the portable class files the image requires
 set (image_class_files
    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/CoreClasses.orx
    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/StreamClasses.orx
+   ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/CommandClasses.orx
    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/PlatformObjects.orx)
 
 # On Windows, the ole support is also included in the image
@@ -1473,6 +1556,7 @@ if (WIN32)
    add_executable(oodialog_exe WIN32 ${build_extensions_oodialog_dir}/oodWinMain.cpp
                                      ${build_extensions_oodialog_dir}/oodShared.cpp
                                      ${build_extensions_oodialog_dir}/ooDialogWinMain.rc)
+   add_dependencies(oodialog_exe oodialog)
 # We need to override the PDB output file name for oodialog.exe so it doesn't overwrite
 # the file for oodialog.dll, which essentially makes oodialog undebuggable on Windows
 # we want to append, which is a little bit of a pain.
@@ -1500,7 +1584,7 @@ if (WIN32)
                 ${build_extensions_oodialog_dir})
    target_link_libraries(oodialog_exe rexx rexxapi shlwapi)
    add_custom_command(TARGET oodialog_exe POST_BUILD
-      DEPENDS ${EXE_MANIFEST_FILE}
+      # DEPENDS ${EXE_MANIFEST_FILE}
       COMMAND "mt.exe" -nologo -manifest \"${EXE_MANIFEST_FILE}\" "-inputresource:bin\\ooDialog.exe;#1" "-outputresource:bin\\ooDialog.exe;#1"
       COMMENT "Adding custom manifest to ooDialog.exe...")
    install(TARGETS oodialog_exe RUNTIME COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE_DIR})
@@ -1510,6 +1594,7 @@ if (WIN32)
    add_executable(oodialog_com ${build_extensions_oodialog_dir}/oodMain.cpp
                                ${build_extensions_oodialog_dir}/oodShared.cpp
                                ${build_extensions_oodialog_dir}/ooDialogMain.rc)
+   add_dependencies(oodialog_com oodialog_exe)
 # We need to override the PDB output file name for oodialog.com so it doesn't overwrite
 # the file for oodialog.dll, which essentially makes oodialog undebuggable on Windows
 # we want to append, which is a little bit of a pain.
@@ -1538,7 +1623,7 @@ if (WIN32)
                 ${build_extensions_oodialog_dir})
    target_link_libraries(oodialog_com rexx rexxapi shell32 Advapi32)
    add_custom_command(TARGET oodialog_com POST_BUILD
-      DEPENDS ${EXE_MANIFEST_FILE}
+      # DEPENDS ${EXE_MANIFEST_FILE}
       COMMAND "mt.exe" -nologo -manifest \"${EXE_MANIFEST_FILE}\" "-inputresource:bin\\ooDialog.com;#1" "-outputresource:bin\\ooDialog.com;#1"
       COMMENT "Adding custom manifest to ooDialog.com...")
    install(TARGETS oodialog_com RUNTIME COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE_DIR})
@@ -1597,7 +1682,7 @@ if (WIN32)
                ${build_messages_dir})
    target_link_libraries(rexxhide rexx rexxapi)
    add_custom_command(TARGET rexxhide POST_BUILD
-      DEPENDS ${EXE_MANIFEST_FILE}
+      # DEPENDS ${EXE_MANIFEST_FILE}
       COMMAND "mt.exe" -nologo -manifest \"${EXE_MANIFEST_FILE}\" "-inputresource:bin\\rexxhide.exe;#1" "-outputresource:bin\\rexxhide.exe;#1"
       COMMENT "Adding custom manifest to rexxhide.exe...")
    install(TARGETS rexxhide RUNTIME COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE_DIR})
@@ -1617,7 +1702,7 @@ if (WIN32)
                ${build_messages_dir})
    target_link_libraries(rexxpaws rexx rexxapi)
    add_custom_command(TARGET rexxpaws POST_BUILD
-      DEPENDS ${EXE_MANIFEST_FILE}
+      # DEPENDS ${EXE_MANIFEST_FILE}
       COMMAND "mt.exe" -nologo -manifest \"${EXE_MANIFEST_FILE}\" "-inputresource:bin\\rexxpaws.exe;#1" "-outputresource:bin\\rexxpaws.exe;#1"
       COMMENT "Adding custom manifest to rexxpaws.exe...")
    install(TARGETS rexxpaws RUNTIME COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE_DIR})
@@ -1632,13 +1717,45 @@ endif ()
 copy_build_file(rxregexp.cls     ${build_extensions_rxregexp_dir})
 copy_build_file(rxftp.cls        ${build_extensions_rxftp_dir})
 copy_build_file(csvStream.cls    ${build_extensions_csvstream_dir})
+copy_build_file(logicalwrapper.cls ${build_extensions_logicalwrapper_dir})
 copy_build_file(json.cls         ${build_extensions_json_dir})
+copy_build_file(json.dtd         ${build_extensions_json_dir})
+copy_build_file(json.xsd         ${build_extensions_json_dir})
+copy_build_file(xmlToJson.xsl    ${build_extensions_json_dir})
+copy_build_file(yaml.cls         ${build_extensions_yaml_dir})
+copy_build_file(yaml.dtd         ${build_extensions_yaml_dir})
+copy_build_file(yaml.xsd         ${build_extensions_yaml_dir})
+copy_build_file(xmlToYaml.xsl    ${build_extensions_yaml_dir})
+# The Rexx Parser and Highlighter (RFE #878): parser.cls, and the parser/
+# directory next to it (classes, HLDrivers/, css/ and resources/), as they are
+copy_build_file(parser.cls       ${build_extensions_parser_dir})
+file(GLOB_RECURSE parser_files RELATIVE
+     ${CMAKE_CURRENT_SOURCE_DIR}/${build_extensions_parser_dir}
+     ${CMAKE_CURRENT_SOURCE_DIR}/${build_extensions_parser_dir}/parser/*)
+set (parser_build_files ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/parser.cls)
+foreach (parser_file ${parser_files})
+    copy_build_file(${parser_file} ${build_extensions_parser_dir})
+    list(APPEND parser_build_files ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${parser_file})
+endforeach ()
+# Its utilities, with the shebang line adjusted: highlight, fencedcode and
+# rexxcheck go to the bin directory, as rexxtry; elements, elident, rxcomp,
+# trident, identtest and erexx are samples
+foreach (parser_utility highlight.rex fencedcode.rex rexxcheck.rex)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/${build_extensions_parser_dir}/utilities/${parser_utility}
+                   ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${parser_utility} @ONLY)
+endforeach ()
+foreach (parser_sample elements.rex elident.rex rxcomp.rex trident.rex identtest.rex erexx.rex)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/${build_extensions_parser_dir}/samples/${parser_sample}
+                   ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/${parser_sample} @ONLY)
+endforeach ()
 copy_build_file(dateparser.cls   ${build_extensions_dateparser_dir})
 copy_build_file(socket.cls       ${build_extensions_rxsock_dir})
 copy_build_file(streamsocket.cls ${build_extensions_rxsock_dir})
 copy_build_file(mime.cls         ${build_extensions_rxsock_dir})
 copy_build_file(smtp.cls         ${build_extensions_rxsock_dir})
+copy_samples_file(cmdhandlers.cls   ${build_samples_dir})
 copy_samples_file(complex.cls       ${build_samples_dir})
+copy_samples_file(ledit.cls         ${build_samples_dir})
 copy_samples_file(pipe.cls          ${build_samples_dir})
 copy_samples_file(semcls.cls        ${build_samples_dir})
 copy_samples_file(treeDirectory.cls ${build_samples_dir})
@@ -1659,6 +1776,7 @@ configure_build_file(greply.rex ${build_samples_dir})
 configure_build_file(guess.rex ${build_samples_dir})
 configure_build_file(interface.rex ${build_samples_dir})
 configure_build_file(ktguard.rex ${build_samples_dir})
+configure_build_file(ledwords.rex ${build_samples_dir})
 configure_build_file(makestring.rex ${build_samples_dir})
 configure_build_file(month.rex ${build_samples_dir})
 configure_build_file(philfork.rex ${build_samples_dir})
@@ -1677,7 +1795,9 @@ configure_build_file(stack.rex ${build_samples_dir})
 configure_build_file(synchronousConcurrency.rex ${build_samples_dir})
 configure_build_file(timezone.rex ${build_samples_dir})
 configure_build_file(treeTraversal.rex ${build_samples_dir})
+configure_build_file(usecmdhandlers.rex ${build_samples_dir})
 configure_build_file(usecomp.rex ${build_samples_dir})
+configure_build_file(useledit.rex ${build_samples_dir})
 configure_build_file(usepipe.rex ${build_samples_dir})
 configure_build_file(usesingleton.rex ${build_samples_dir})
 configure_build_file(usetree.rex ${build_samples_dir})
@@ -1686,14 +1806,24 @@ add_custom_target(class_files ALL DEPENDS
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/rxregexp.cls
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/rxftp.cls
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/csvStream.cls
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/logicalwrapper.cls
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/json.cls
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/json.dtd
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/json.xsd
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xmlToJson.xsl
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/yaml.cls
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/yaml.dtd
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/yaml.xsd
+    ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xmlToYaml.xsl
+    ${parser_build_files}
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/socket.cls
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/streamsocket.cls
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/mime.cls
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/smtp.cls
     ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dateparser.cls
-
+    ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/cmdhandlers.cls
     ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/complex.cls
+    ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/ledit.cls
     ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/pipe.cls
     ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/semcls.cls
     ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/treeDirectory.cls
@@ -1706,7 +1836,17 @@ install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/rxregexp.cls COMPONENT Core DEST
 install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/rxftp.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
 
 install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/csvStream.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/logicalwrapper.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
 install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/json.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/json.dtd COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/json.xsd COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xmlToJson.xsl COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/yaml.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/yaml.dtd COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/yaml.xsd COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/xmlToYaml.xsl COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/parser.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
+install(DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/parser COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
 install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/dateparser.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
 
 install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/socket.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
@@ -1715,6 +1855,10 @@ install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/mime.cls COMPONENT Core DESTINAT
 install(FILES ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/smtp.cls COMPONENT Core DESTINATION ${INSTALL_CLS_DIR})
 # technically a sample, but this is so useful we add it to the binary dir
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/rexxtry.rex COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE_DIR})
+# the utilities of the Rexx Parser (RFE #878)
+install(PROGRAMS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/highlight.rex COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE_DIR})
+install(PROGRAMS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/fencedcode.rex COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE_DIR})
+install(PROGRAMS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/rexxcheck.rex COMPONENT Core DESTINATION ${INSTALL_EXECUTABLE_DIR})
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/${build_api_dir}/rexx.h COMPONENT DevLib DESTINATION ${INSTALL_INCLUDE_DIR})
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/${build_api_dir}/rexxapidefs.h COMPONENT DevLib DESTINATION ${INSTALL_INCLUDE_DIR})
@@ -1738,6 +1882,7 @@ install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/greply.rex COMPONENT Samples 
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/guess.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/interface.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/ktguard.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/ledwords.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/makestring.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/month.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/philfork.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
@@ -1754,12 +1899,22 @@ install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/stack.rex COMPONENT Samples D
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/synchronousConcurrency.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/timezone.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/treeTraversal.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/usecmdhandlers.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/usecomp.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/useledit.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/usepipe.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/usesingleton.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/usetree.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/elements.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/elident.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/rxcomp.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/trident.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/identtest.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${CMAKE_SAMPLES_OUTPUT_DIRECTORY}/erexx.rex COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 
+install(PROGRAMS ${SAMPLES_SOURCE}/cmdhandlers.cls COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${SAMPLES_SOURCE}/complex.cls COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
+install(PROGRAMS ${SAMPLES_SOURCE}/ledit.cls COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${SAMPLES_SOURCE}/pipe.cls COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${SAMPLES_SOURCE}/semcls.cls COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
 install(PROGRAMS ${SAMPLES_SOURCE}/treeDirectory.cls COMPONENT Samples DESTINATION ${INSTALL_SAMPLES_DIR})
@@ -1941,6 +2096,7 @@ if (DOC_SOURCE_DIR)
    install(FILES ${build_extensions_oodialog_dir}/ooDialog_ReleaseNotes.txt COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
    install(FILES ${DOC_SOURCE_DIR}/oodguide.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
    install(FILES ${DOC_SOURCE_DIR}/rexxextensions.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
+   install(FILES ${DOC_SOURCE_DIR}/rexxparser.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
    install(FILES ${DOC_SOURCE_DIR}/winextensions.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
    install(FILES ${SAMPLES_SOURCE}/windows/oodialog/ooRexxTry/doc/ooRexxTry.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
 
@@ -1957,6 +2113,7 @@ if (DOC_SOURCE_DIR)
    install_doc_shortcut("ooDialog Release Notes" "ooDialog_ReleaseNotes.txt")
    install_doc_shortcut("ooDialog User Guide" "oodguide.pdf")
    install_doc_shortcut("ooRexx Extensions Reference" "rexxextensions.pdf")
+   install_doc_shortcut("ooRexx Rexx Parser Reference" "rexxparser.pdf")
    install_doc_shortcut("ooRexx Windows Reference" "winextensions.pdf")
    install_doc_shortcut("ooRexxTry Reference" "ooRexxTry.pdf")
 
@@ -2010,6 +2167,7 @@ if (DOC_SOURCE_DIR)
                  ${DOC_SOURCE_DIR}/oodialog.pdf
                  ${DOC_SOURCE_DIR}/oodguide.pdf
                  ${DOC_SOURCE_DIR}/rexxextensions.pdf
+                 ${DOC_SOURCE_DIR}/rexxparser.pdf
                  ${DOC_SOURCE_DIR}/winextensions.pdf
                  ${build_platform_dir}/install/cpack.nsi
          VERBATIM
@@ -2082,6 +2240,7 @@ if (DOC_SOURCE_DIR)
 
 	   install(FILES ${DOC_SOURCE_DIR}/rexxapi.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
 	   install(FILES ${DOC_SOURCE_DIR}/rexxextensions.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
+	   install(FILES ${DOC_SOURCE_DIR}/rexxparser.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
 
 	   install(FILES ${DOC_SOURCE_DIR}/rexxpg.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})
 	   install(FILES ${DOC_SOURCE_DIR}/rexxref.pdf COMPONENT Docs DESTINATION ${INSTALL_DOC_DIR})

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -66,6 +66,7 @@
 #include "InterpreterInstance.hpp"
 #include "ActivityDispatcher.hpp"
 #include "MessageDispatcher.hpp"
+#include "ConditionTrappingDispatcher.hpp"
 #include "Interpreter.hpp"
 #include "PackageClass.hpp"
 #include "SystemInterpreter.hpp"
@@ -131,6 +132,7 @@ void Activity::live(size_t liveMark)
     memory_mark(requiresTable);
     memory_mark(waitingObject);
     memory_mark(dispatchMessage);
+    memory_mark(haltRequestDescription);
     memory_mark(heldMutexes);
     memory_mark(spawnerStackFrameInfo);
 
@@ -165,6 +167,7 @@ void Activity::liveGeneral(MarkReason reason)
     memory_mark_general(requiresTable);
     memory_mark_general(waitingObject);
     memory_mark_general(dispatchMessage);
+    memory_mark_general(haltRequestDescription);
     memory_mark_general(heldMutexes);
     memory_mark_general(spawnerStackFrameInfo);
 
@@ -175,6 +178,7 @@ void Activity::liveGeneral(MarkReason reason)
     while (p != NULL)
     {
         p->markGeneral(reason);
+        p = p->next;
     }
 }
 
@@ -259,6 +263,7 @@ void Activity::runThread()
         // reset our semaphores
         runSem.reset();
         guardSem.reset();
+        reserveSem.reset();
 
         // try to pool this.  If the ActivityManager doesn't take it,
         // we go into termination mode
@@ -284,6 +289,7 @@ void Activity::cleanupActivityResources()
     // close our semaphores and destroy the thread.
     runSem.close();
     guardSem.close();
+    reserveSem.close();
     currentThread.close();
     // make sure any mutexes we are holding get released
     cleanupMutexes();
@@ -311,7 +317,7 @@ void Activity::clearLocalReferences()
  * We're leaving the current thread.  So we need to deactivate
  * this.
  */
-void Activity::exitCurrentThread()
+void Activity::exitCurrentThread(bool dispatch)
 {
     // deactivate the nesting level
     deactivate();
@@ -322,7 +328,7 @@ void Activity::exitCurrentThread()
     }
     // this activity owned the kernel semaphore before entering here...release it
     // now.
-    releaseAccess();
+    releaseAccess(dispatch);
 }
 
 
@@ -362,6 +368,7 @@ Activity::Activity(GlobalProtectedObject &p, bool createThread)
     // an activity has a couple of semaphores it uses to synchronize execution.
     runSem.create();
     guardSem.create();
+    reserveSem.create();
     activationStackSize = ACT_STACK_SIZE;
     // stack checking is enabled by default
     stackcheck = true;
@@ -537,6 +544,10 @@ wholenumber_t Activity::displayCondition(DirectoryClass *errorInfo)
         return 0;   // no error condition to return
     }
 
+    // a thrown condition that nothing has caught is error 4.1 (RFE #31)
+    Protected<DirectoryClass> uncaught = uncaughtThrown(errorInfo);
+    errorInfo = uncaught;
+
     RexxString *condition = (RexxString *)errorInfo->get(GlobalNames::CONDITION);
     // we only display syntax conditions
     if (condition == OREF_NULL || !condition->isEqual(GlobalNames::SYNTAX))
@@ -568,33 +579,114 @@ wholenumber_t Activity::errorNumber(DirectoryClass *conditionObject)
     wholenumber_t rc = Error_Interpretation / 1000;
     if (conditionObject != OREF_NULL)
     {
+        RexxString *condition = (RexxString *)conditionObject->get(GlobalNames::CONDITION);
+        // a thrown condition that nothing has caught is error 4.1 (RFE #31)
+        if (condition != OREF_NULL && !condition->strCompare(GlobalNames::SYNTAX) && isThrown(condition, conditionObject))
+        {
+            return Error_Program_interrupted / 1000;
+        }
         // try to convert.  Leaves unchanged if not value
-        conditionObject->get(GlobalNames::RC)->numberValue(rc);
+        RexxObject *rcValue = (RexxObject *)conditionObject->get(GlobalNames::RC);
+        if (rcValue != OREF_NULL)
+        {
+            rcValue->numberValue(rc);
+        }
     }
     return rc;
 }
 
 
 /**
- * Raise a condition, with potential trapping.
- * Also checks for potential ::OPTIONS condition overrides.
+ * Test if a condition propagates as an error does: a SYNTAX error,
+ * or a condition thrown by THROW (RFE #31).  Such a condition goes
+ * from caller to caller until it is caught, CALL ON does not trap
+ * it, and a message object or native code that receives it keeps it.
+ *
+ * @param condition The condition name.
+ * @param conditionObj
+ *                  The condition object (can be null).
+ *
+ * @return true if it propagates as an error.
+ */
+bool Activity::isThrown(RexxString *condition, DirectoryClass *conditionObj)
+{
+    if (condition->strCompare(GlobalNames::SYNTAX))
+    {
+        return true;
+    }
+    return conditionObj != OREF_NULL && conditionObj->get(GlobalNames::THROWN) == TheTrueObject;
+}
+
+
+/**
+ * The error a thrown condition that nothing has caught becomes at
+ * the base of a program or a thread: 4.1, "Program interrupted with
+ * condition condition.", or 4.901, "Program interrupted with condition
+ * condition: description.", when its DESCRIPTION is a String that is
+ * not null, with the location and traceback of the thrown condition
+ * (RFE #31).
+ *
+ * @param conditionObj
+ *               The condition object.
+ *
+ * @return The condition object to display: the same one for anything
+ *         that is not a thrown condition other than SYNTAX.
+ */
+DirectoryClass *Activity::uncaughtThrown(DirectoryClass *conditionObj)
+{
+    RexxString *condition = (RexxString *)conditionObj->get(GlobalNames::CONDITION);
+    if (condition == OREF_NULL || !isString(condition) || condition->strCompare(GlobalNames::SYNTAX) || !isThrown(condition, conditionObj))
+    {
+        return conditionObj;
+    }
+    // with a description, 4.901 says it.  A description that is not a String
+    // is left out: its string value could raise a condition of its own here
+    RexxObject *description = (RexxObject *)conditionObj->get(GlobalNames::DESCRIPTION);
+    Protected<DirectoryClass> error;
+    if (description != OREF_NULL && isString(description) && ((RexxString *)description)->getLength() > 0)
+    {
+        error = createExceptionObject(Error_Program_interrupted_condition_description, OREF_NULL, new_array(condition, description), OREF_NULL);
+    }
+    else
+    {
+        error = createExceptionObject(Error_Program_interrupted_condition, OREF_NULL, new_array(condition), OREF_NULL);
+    }
+    // where it was thrown, not where it is displayed
+    RexxInternalObject *items[] = { GlobalNames::TRACEBACK, GlobalNames::STACKFRAMES, GlobalNames::POSITION, GlobalNames::PROGRAM, GlobalNames::PACKAGE_REF };
+    for (size_t i = 0; i < sizeof(items) / sizeof(items[0]); i++)
+    {
+        RexxInternalObject *value = conditionObj->get((RexxString *)items[i]);
+        if (value != OREF_NULL)
+        {
+            error->put(value, (RexxString *)items[i]);
+        }
+        else
+        {
+            error->remove((RexxString *)items[i]);
+        }
+    }
+    error->put(TheTrueObject, GlobalNames::PROPAGATED);
+    return error;
+}
+
+
+/**
+ * Check for ::OPTIONS condition SYNTAX overrides for a condition
+ * about to be raised.  If the current Rexx frame's package has
+ * the option for this condition, a SYNTAX error is raised instead
+ * and this does not return.
  *
  * @param condition  The condition name.
- * @param rc         The rc value
  * @param description
  *                   The description value.
- * @param additional the exception additional information.
  * @param result     The condition result info.
- *
- * @return true if this was trapped via CALL ON, false for untrapped
- *         conditions.
  */
-bool Activity::raiseCondition(RexxString *condition, RexxObject *rc, RexxObject *description, RexxObject *additional, RexxObject *result)
+void Activity::checkConditionSyntaxOptions(RexxString *condition, RexxObject *description, RexxObject *result)
 {
-    // if we have ::OPTIONS condition SYNTAX set on the package, we
-    // raise a SYNTAX error instead of raising the condition
     RexxActivation *activation = getCurrentRexxFrame();
-    if (activation != OREF_NULL)
+    // an active CATCH clause for the condition wins over the option, which
+    // applies again once the block has ended (RFE #31)
+    if (activation != OREF_NULL && !activation->catches(condition))
     {
         if (activation->isErrorSyntaxEnabled() && condition->strCompare(GlobalNames::ERRORNAME))
         {
@@ -617,6 +709,28 @@ bool Activity::raiseCondition(RexxString *condition, RexxObject *rc, RexxObject 
             reportException(Error_Execution_notready_syntax, description);
         }
     }
+}
+
+
+/**
+ * Raise a condition, with potential trapping.
+ * Also checks for potential ::OPTIONS condition overrides.
+ *
+ * @param condition  The condition name.
+ * @param rc         The rc value
+ * @param description
+ *                   The description value.
+ * @param additional the exception additional information.
+ * @param result     The condition result info.
+ *
+ * @return true if this was trapped via CALL ON, false for untrapped
+ *         conditions.
+ */
+bool Activity::raiseCondition(RexxString *condition, RexxObject *rc, RexxObject *description, RexxObject *additional, RexxObject *result)
+{
+    // if we have ::OPTIONS condition SYNTAX set on the package, we
+    // raise a SYNTAX error instead of raising the condition
+    checkConditionSyntaxOptions(condition, description, result);
 
     // check the context first to see if this will be trapped.  Creating
     // the condition object is pretty expensive, so we want to avoid
@@ -705,6 +819,170 @@ bool Activity::raiseCondition(DirectoryClass *conditionObj)
 
 
 /**
+ * Convert a SYNTAX error code in "nn.nnn" form to an error number
+ * (the same rules as Interpreter::messageNumber(), but without
+ * raising an error).
+ *
+ * @param code   The error code string.
+ * @param number The error number (major * 1000 + minor).
+ *
+ * @return true if the code is valid, false otherwise.
+ */
+static bool validErrorCode(RexxString *code, wholenumber_t &number)
+{
+    const char *data = code->getStringData();
+    size_t length = code->getLength();
+    const char *decimalPoint = (const char *)memchr(data, '.', length);
+    size_t majorLength = decimalPoint == NULL ? length : decimalPoint - data;
+
+    wholenumber_t primary;
+    if (!new_string(data, majorLength)->numberValue(primary) || primary < 1 || primary >= 100)
+    {
+        return false;
+    }
+
+    wholenumber_t secondary = 0;
+    if (decimalPoint != NULL)
+    {
+        if (!new_string(decimalPoint + 1, length - majorLength - 1)->numberValue(secondary) || secondary < 0 || secondary >= 1000)
+        {
+            return false;
+        }
+    }
+    number = primary * 1000 + secondary;
+    return true;
+}
+
+
+/**
+ * Raise a condition described by an existing condition object,
+ * for the RaiseConditionObject() and ThrowObject() APIs.  A copy of
+ * the object is raised, with everything it holds (RC, DESCRIPTION,
+ * ADDITIONAL, RESULT...), as the condition it describes: a SYNTAX
+ * error is raised as an error; any other condition, if it is raised,
+ * as RaiseCondition() raises it, after the ::OPTIONS condition SYNTAX
+ * checks, and if it is thrown, as Throw() throws it, but left pending
+ * until the native code returns (RFE #31).
+ *
+ * @param source The condition object.
+ * @param mode   CONDITION_RAISE (RaiseConditionObject()): THROWN is set
+ *               .false, and the condition is raised one level, as RAISE
+ *               does.  CONDITION_THROW (ThrowObject()): THROWN is set
+ *               .true, and the condition is thrown, as THROW does.
+ *               CONDITION_AS_IS (the interpreter raising again a
+ *               condition it got): thrown if its THROWN is .true, and
+ *               raised otherwise, with THROWN .false.
+ */
+void Activity::raiseConditionObject(DirectoryClass *source, ConditionObjectMode mode)
+{
+    RexxInternalObject *name = source->get(GlobalNames::CONDITION);
+    if (name == OREF_NULL || !isString(name))
+    {
+        reportException(Error_Incorrect_method_user_defined, new_string("the condition object has no CONDITION name"));
+    }
+    Protected<RexxString> condition = ((RexxString *)name)->upper();
+
+    // we raise a copy, so the caller's object is left as it is
+    Protected<DirectoryClass> conditionObj = (DirectoryClass *)source->copy();
+    conditionObj->put(condition, GlobalNames::CONDITION);
+
+    // every condition object has a THROWN entry, .true or .false (an object
+    // built by hand may have none)
+    bool thrown = mode == CONDITION_THROW || (mode == CONDITION_AS_IS && conditionObj->get(GlobalNames::THROWN) == TheTrueObject);
+    conditionObj->put(thrown ? TheTrueObject : TheFalseObject, GlobalNames::THROWN);
+
+    RexxObject *description = (RexxObject *)conditionObj->get(GlobalNames::DESCRIPTION);
+    RexxObject *result = (RexxObject *)conditionObj->get(GlobalNames::RESULT);
+    if (description == OREF_NULL)
+    {
+        conditionObj->put(GlobalNames::NULLSTRING, GlobalNames::DESCRIPTION);
+    }
+
+    // a condition object built by hand may not have its location information
+    RexxInternalObject *traceback = conditionObj->get(GlobalNames::TRACEBACK);
+    RexxInternalObject *stackFrames = conditionObj->get(GlobalNames::STACKFRAMES);
+    if (traceback == OREF_NULL || !isOfClass(List, traceback) || stackFrames == OREF_NULL || !isOfClass(List, stackFrames))
+    {
+        generateProgramInformation(conditionObj);
+    }
+
+    if (condition->strCompare(GlobalNames::SYNTAX))
+    {
+        completeSyntaxCondition(conditionObj);
+        conditionObj->put(TheFalseObject, GlobalNames::PROPAGATED);
+
+        // and raise it as an error raised from native code (see raiseException())
+        if (!raiseCondition(conditionObj))
+        {
+            conditionObj->put(TheTrueObject, GlobalNames::PROPAGATED);
+            raisePropagate(conditionObj);
+        }
+        return;
+    }
+
+    // ::OPTIONS condition SYNTAX applies as for RaiseCondition(), and not
+    // to a thrown condition, as for THROW
+    if (!thrown)
+    {
+        checkConditionSyntaxOptions(condition, description, result);
+    }
+    conditionObj->put(TheFalseObject, GlobalNames::PROPAGATED);
+    // a thrown condition is kept by the native activation, as an error is,
+    // and thrown again when the native code returns (see
+    // NativeActivation::checkConditions())
+    raiseCondition(conditionObj);
+}
+
+
+/**
+ * Check the CODE and ADDITIONAL of a SYNTAX condition object and
+ * set its RC, ERRORTEXT and MESSAGE from them, as
+ * createExceptionObject() does.  The object may have been built or
+ * changed by Rexx code: the argument of RaiseConditionObject(), or
+ * the condition object of a message object, which ~result raises
+ * again.
+ *
+ * @param conditionObj The condition object.
+ */
+void Activity::completeSyntaxCondition(DirectoryClass *conditionObj)
+{
+    RexxInternalObject *code = conditionObj->get(GlobalNames::CODE);
+    wholenumber_t errcode;
+    if (code == OREF_NULL || !isString(code) || !validErrorCode((RexxString *)code, errcode))
+    {
+        reportException(Error_Incorrect_method_user_defined, new_string("the CODE of a SYNTAX condition object must be a valid error number"));
+    }
+    RexxInternalObject *additional = conditionObj->get(GlobalNames::ADDITIONAL);
+    if (additional == OREF_NULL)
+    {
+        additional = new_array((size_t)0);
+        conditionObj->put(additional, GlobalNames::ADDITIONAL);
+    }
+    else if (!isArray(additional))
+    {
+        reportException(Error_Incorrect_method_user_defined, new_string("the ADDITIONAL of a SYNTAX condition object must be an array"));
+    }
+
+    wholenumber_t primary = (errcode / 1000) * 1000;
+    RexxString *errortext = Interpreter::getMessageText(primary);
+    if (errortext == OREF_NULL)
+    {
+        reportException(Error_Execution_error_condition, (RexxObject *)code);
+    }
+    conditionObj->put(new_integer(primary / 1000), GlobalNames::RC);
+    conditionObj->put(errortext, GlobalNames::ERRORTEXT);
+    if (primary != errcode)
+    {
+        conditionObj->put(buildMessage(errcode, (ArrayClass *)additional), GlobalNames::MESSAGE);
+    }
+    else
+    {
+        conditionObj->put(TheNilObject, GlobalNames::MESSAGE);
+    }
+}
+
+
+/**
  * Create a condition object from the provided information.
  *
  * @param condition  The name of the raised condition.
@@ -725,6 +1003,8 @@ DirectoryClass* Activity::createConditionObject(RexxString *condition, RexxObjec
     conditionObj->put(condition, GlobalNames::CONDITION);
     conditionObj->put(description == OREF_NULL ? GlobalNames::NULLSTRING : description, GlobalNames::DESCRIPTION);
     conditionObj->put(TheFalseObject, GlobalNames::PROPAGATED);
+    // raised, not thrown (RFE #31)
+    conditionObj->put(TheFalseObject, GlobalNames::THROWN);
 
     // the remainders don't have defaults, so only add the items if provided.
     if (rc != OREF_NULL)
@@ -928,6 +1208,15 @@ void Activity::raiseException(RexxErrorCodes errcode, RexxString *description, A
     // get the top-most stack frame and also the top Rexx frame
     ActivationBase *topFrame = getTopStackFrame();
     RexxActivation *activation = getCurrentRexxFrame();
+
+    // create an exception object.  This must be done before the forwarded
+    // frames are removed below: their activations stay linked in the
+    // activation frames (their run() has not returned yet), which the
+    // exception object is built from, but once removed from the stack they
+    // are no longer marked, and a garbage collection while the object is
+    // being built would reclaim them.
+    conditionobj = createExceptionObject(errcode, description, additional, result);
+
     // if we're raised within a real Rexx context, we need to deal with forwarded
     // frames
     if (topFrame == activation)
@@ -945,9 +1234,6 @@ void Activity::raiseException(RexxErrorCodes errcode, RexxString *description, A
     {
         activation = NULL;      // raised from a native context, don't add to stack trace
     }
-
-    // create an exception object
-    conditionobj = createExceptionObject(errcode, description, additional, result);
 
     // and go raise as a condition
     if (!raiseCondition(conditionobj))
@@ -1063,6 +1349,8 @@ DirectoryClass* Activity::createExceptionObject(RexxErrorCodes errcode,
     // fill in the propagation status.  This is always false for the first
     // potential trap level, gets turned to true if this goes down levels.
     exobj->put(TheFalseObject, GlobalNames::PROPAGATED);
+    // raised by the interpreter or RAISE, not thrown (RFE #31)
+    exobj->put(TheFalseObject, GlobalNames::THROWN);
 
     return exobj;
 }
@@ -1222,7 +1510,11 @@ RexxString* Activity::buildMessage(wholenumber_t messageCode, ArrayClass *substi
     // bad message if we can't find this
     if (message == OREF_NULL)
     {
-        reportException(Error_Execution_error_condition, messageCode);
+        // show the code in the "nn.nnn" form of a CODE (93.9),
+        // not as the internal number (93009)
+        char work[32];
+        snprintf(work, sizeof(work), "%d.%d", (int)(messageCode / 1000), (int)(messageCode % 1000));
+        reportException(Error_Execution_error_condition, new_string(work));
     }
     // do required substitutions
     return messageSubstitution(message, substitutions);
@@ -1325,6 +1617,10 @@ RexxString* Activity::messageSubstitution(RexxString *message, ArrayClass  *addi
  */
 void Activity::reraiseException(DirectoryClass *exobj)
 {
+    // keep the condition object anchored while it propagates: the native
+    // activation that held it is popped by raisePropagate() before a Rexx
+    // frame traps it, and a collection in between would take it
+    conditionobj = exobj;
     RexxActivation *activation = getCurrentRexxFrame();
     // have a target activation?  Replace the
     // package information from the original with the current.
@@ -1344,22 +1640,13 @@ void Activity::reraiseException(DirectoryClass *exobj)
         exobj->remove(GlobalNames::PACKAGE_REF);
     }
 
-    // get the error code and redo the message information
-    RexxInternalObject *errorcode = exobj->get(GlobalNames::CODE);
-    wholenumber_t errornumber = Interpreter::messageNumber((RexxString *)errorcode);
-
-    wholenumber_t primary = (errornumber / 1000) * 1000;
-    if (errornumber != primary)
+    // redo the message information from the error code (the object
+    // ~result raises again can have been changed by Rexx code).  A thrown
+    // condition other than SYNTAX has none (RFE #31)
+    RexxString *condition = (RexxString *)exobj->get(GlobalNames::CONDITION);
+    if (condition != OREF_NULL && isString(condition) && condition->strCompare(GlobalNames::SYNTAX))
     {
-        char work[22];
-        snprintf(work, sizeof(work), "%1zd%3.3zd", errornumber / 1000, errornumber - primary);
-        errornumber = atol(work);
-
-        RexxString *message = Interpreter::getMessageText(errornumber);
-        ArrayClass *additional = (ArrayClass *)exobj->get(GlobalNames::ADDITIONAL);
-        message = messageSubstitution(message, additional);
-        // replace the original message text
-        exobj->put(message, GlobalNames::MESSAGE);
+        completeSyntaxCondition(exobj);
     }
 
     raisePropagate(exobj);
@@ -1402,6 +1689,198 @@ void Activity::raisePropagate(DirectoryClass *conditionObj)
     kill(conditionObj);
 }
 
+
+/**
+ * Throw a condition with THROW (RFE #31): it is raised where THROW
+ * runs, and if that level does not catch it, it goes from caller to
+ * caller until something catches it, as a SYNTAX error does.  This
+ * does not return.
+ *
+ * @param conditionObj
+ *               The condition object.
+ */
+void Activity::throwCondition(DirectoryClass *conditionObj)
+{
+    // anchored while it propagates (see reraiseException())
+    conditionobj = conditionObj;
+    conditionObj->put(TheTrueObject, GlobalNames::THROWN);
+    conditionObj->put(TheFalseObject, GlobalNames::PROPAGATED);
+
+    // as for an error (see raiseException())
+    ActivationBase *topFrame = getTopStackFrame();
+    RexxActivation *activation = getCurrentRexxFrame();
+    if (topFrame == activation)
+    {
+        while (activation != OREF_NULL && activation->isForwarded())
+        {
+            popStackFrame(activation);
+            activation = getCurrentRexxFrame();
+        }
+    }
+    else
+    {
+        activation = NULL;
+    }
+
+    if (!raiseCondition(conditionObj))
+    {
+        conditionObj->put(TheTrueObject, GlobalNames::PROPAGATED);
+        if (activation != OREF_NULL)
+        {
+            unwindToFrame(activation);
+            popStackFrame(activation);
+        }
+        raisePropagate(conditionObj);
+    }
+    // (a CALL ON trap does not catch a thrown condition, see trap(): a
+    // Rexx activation that catches it does not return here)
+}
+
+
+/**
+ * Create the condition object of a THROW, or of the Throw() API, and
+ * throw it (RFE #31).  This does not return.
+ *
+ * @param condition The condition name, in uppercase ("USER name" for a
+ *                  user condition).
+ * @param rc        The RC (ERROR and FAILURE), or, for SYNTAX, the error
+ *                  number as an Integer (major * 1000 + minor).
+ * @param description
+ *                  The DESCRIPTION, or OREF_NULL.
+ * @param additional
+ *                  The ADDITIONAL information, or OREF_NULL.  For SYNTAX,
+ *                  the Array of substitution values.
+ */
+void Activity::throwNewCondition(RexxString *condition, RexxObject *rc, RexxString *description, RexxObject *additional)
+{
+    Protected<DirectoryClass> conditionObj;
+    // THROW SYNTAX: an error, as RAISE SYNTAX raises it
+    if (condition->strCompare(GlobalNames::SYNTAX))
+    {
+        conditionObj = createExceptionObject((RexxErrorCodes)((RexxInteger *)rc)->getValue(), description, (ArrayClass *)additional, OREF_NULL);
+    }
+    else
+    {
+        conditionObj = createConditionObject(condition, rc, description, additional, OREF_NULL);
+    }
+    throwCondition(conditionObj);
+}
+
+
+/**
+ * The Throw() API (RFE #31): throw a condition from native code, as
+ * the THROW instruction does.  The arguments are checked as THROW
+ * checks them; then the condition is thrown, and this does not return:
+ * the native method, routine or exit ends here.
+ *
+ * @param name      The condition name, as for RaiseCondition(): one of
+ *                  the names THROW accepts, with "USER name" for a user
+ *                  condition.
+ * @param rc        The RC: required for ERROR, FAILURE and SYNTAX (for
+ *                  SYNTAX, the error code as in Rexx, "nn.nnn", or "nn",
+ *                  CODE nn.0, as for THROW SYNTAX nn), and not allowed
+ *                  for any other condition.
+ * @param description
+ *                  The description, or OREF_NULL.
+ * @param additional
+ *                  The additional information, or OREF_NULL.  For SYNTAX,
+ *                  an Array of substitution values.
+ */
+void Activity::apiThrow(const char *name, RexxObject *rc, RexxObject *description, RexxObject *additional)
+{
+    if (name == NULL)
+    {
+        reportException(Error_Incorrect_method_user_defined, new_string("Throw needs a condition name"));
+    }
+    Protected<RexxString> condition = new_upper_string(name);
+    // the names THROW accepts: one word, or USER and the user condition's name
+    wholenumber_t words = condition->words()->getValue();
+    Protected<RexxString> first = words == 0 ? GlobalNames::NULLSTRING : condition->word(IntegerOne);
+    if (first->strCompare("USER"))
+    {
+        if (words != 2)
+        {
+            reportException(Error_Incorrect_method_user_defined, new_string("Throw needs USER and one user condition name"));
+        }
+        // "USER name", with one blank, as THROW USER name has it
+        condition = first->concatWith(condition->word(IntegerTwo), ' ');
+    }
+    else if (words != 1 ||
+        !(first->strCompare(GlobalNames::ERRORNAME) || first->strCompare(GlobalNames::FAILURE) ||
+          first->strCompare(GlobalNames::SYNTAX) || first->strCompare(GlobalNames::HALT) ||
+          first->strCompare(GlobalNames::LOSTDIGITS) || first->strCompare(GlobalNames::NOMETHOD) ||
+          first->strCompare(GlobalNames::NOSTRING) || first->strCompare(GlobalNames::NOTREADY) ||
+          first->strCompare(GlobalNames::NOVALUE)))
+    {
+        reportException(Error_Incorrect_method_user_defined, new_string("Throw cannot throw a condition named \"")->concat(condition)->concatWithCstring("\""));
+    }
+    else
+    {
+        // the name without the blanks around it, as THROW has it
+        condition = first;
+    }
+
+    // an RC with ERROR, FAILURE and SYNTAX, and with nothing else
+    bool hasRC = condition->strCompare(GlobalNames::ERRORNAME) || condition->strCompare(GlobalNames::FAILURE) ||
+        condition->strCompare(GlobalNames::SYNTAX);
+    if (hasRC && rc == OREF_NULL)
+    {
+        reportException(Error_Incorrect_method_user_defined, new_string("Throw needs an RC for an ERROR, FAILURE or SYNTAX condition"));
+    }
+    if (!hasRC && rc != OREF_NULL)
+    {
+        reportException(Error_Incorrect_method_user_defined, new_string("Throw takes an RC only for an ERROR, FAILURE or SYNTAX condition"));
+    }
+    if (description != OREF_NULL && !isString(description))
+    {
+        reportException(Error_Incorrect_method_user_defined, new_string("the Throw description must be a String"));
+    }
+
+    Protected<RexxObject> rcValue = rc;
+    Protected<RexxObject> additionalValue = additional;
+    Protected<RexxString> descriptionValue = (RexxString *)description;
+    // as THROW SYNTAX does (see RexxInstructionRaise::execute())
+    if (condition->strCompare(GlobalNames::SYNTAX))
+    {
+        rcValue = new_integer(Interpreter::syntaxErrorNumber(rc, true));
+        if (descriptionValue.isNull())
+        {
+            descriptionValue = GlobalNames::NULLSTRING;
+        }
+        if (additionalValue.isNull())
+        {
+            additionalValue = new_array();
+        }
+        else
+        {
+            // compared through a plain pointer (MSVC: C2666 with Protected)
+            RexxObject *array = additional->requestArray();
+            if (array == TheNilObject || ((ArrayClass *)array)->isMultiDimensional())
+            {
+                reportException(Error_Execution_syntax_additional);
+            }
+            additionalValue = array;
+        }
+    }
+    throwNewCondition(condition, rcValue, descriptionValue, additionalValue);
+}
+
+/**
+ * Sets a flag for as long as it exists, and gives it back the
+ * value it had, however the block is left.
+ */
+class FlagSetter
+{
+ public:
+    FlagSetter(bool &f, bool value = true) : flag(f), saved(f) { flag = value; }
+    ~FlagSetter() { flag = saved; }
+
+ private:
+    bool &flag;
+    bool saved;
+};
+
+
 /**
  * Display information from an exception object.
  *
@@ -1409,11 +1888,17 @@ void Activity::raisePropagate(DirectoryClass *conditionObj)
  */
 void Activity::display(DirectoryClass *exobj)
 {
-    // get the traceback info
-    ListClass *trace_backList = (ListClass *)exobj->get(GlobalNames::TRACEBACK);
-    if (trace_backList != OREF_NULL)
+    // a .traceoutput target that fails now must not raise its error again,
+    // and once it has failed the rest goes to the console (see traceOutput())
+    FlagSetter displaying(displayingCondition);
+    FlagSetter failed(traceTargetFailed, false);
+
+    // get the traceback info.  Rexx code can change the list, or put
+    // something else in its place, so check what we display
+    RexxInternalObject *trace_backList = exobj->get(GlobalNames::TRACEBACK);
+    if (trace_backList != OREF_NULL && isOfClass(List, trace_backList))
     {
-        ArrayClass *trace_back = trace_backList->makeArray();
+        ArrayClass *trace_back = ((ListClass *)trace_backList)->makeArray();
         ProtectedObject p(trace_back);
 
         // display each of the traceback lines
@@ -1421,10 +1906,12 @@ void Activity::display(DirectoryClass *exobj)
 
         for (size_t i = 1; i <= tracebackSize; i++)
         {
-            RexxString *text = (RexxString *)trace_back->get(i);
+            RexxInternalObject *line = trace_back->get(i);
             // if we have a real line, write it out
-            if (text != OREF_NULL && text != TheNilObject)
+            if (line != OREF_NULL && line != TheNilObject)
             {
+                // not a string: its default name, which runs no Rexx code
+                Protected<RexxString> text = isOfClassType(String, line) ? (RexxString *)line : line->defaultName();
                 currentRexxFrame->displayUsingTraceOutput(this, text);
             }
         }
@@ -1487,6 +1974,10 @@ void Activity::display(DirectoryClass *exobj)
  */
 void Activity::displayDebug(DirectoryClass *exobj)
 {
+    // see display()
+    FlagSetter displaying(displayingCondition);
+    FlagSetter failed(traceTargetFailed, false);
+
     // get the leading part to indicate this is a debug error, then compose the full
     // message
     RexxString *text = Interpreter::getMessageText(Message_Translations_debug_error);
@@ -1514,10 +2005,11 @@ void Activity::displayDebug(DirectoryClass *exobj)
  */
 void Activity::run()
 {
-    // post both of the semaphores.  The activity will be waiting
+    // post all of the semaphores.  The activity will be waiting
     // on one of these on another thread, so we yield control to
     // give the other thread a chance to run.
     guardSem.post();
+    reserveSem.post();
     runSem.post();
     yield();
 }
@@ -1596,6 +2088,7 @@ void Activity::pushStackFrame(ActivationBase *new_activation)
     // push on to the stack and bump the depth
     activations->push(new_activation);
     stackFrameDepth++;
+    new_activation->setStackFrameDepth(stackFrameDepth);
     // update the frame information.
     // if we're not creating a new frame set, link up the new frame with its predecessor
     if (!new_activation->isStackBase())
@@ -1627,6 +2120,7 @@ void Activity::createNewActivationStack()
     // create a new root element on the stack and bump the depth indicator
     activations->push(new_activation);
     stackFrameDepth++;
+    new_activation->setStackFrameDepth(stackFrameDepth);
     // update the frame information.
     updateFrameMarkers();
 }
@@ -2029,14 +2523,16 @@ void Activity::checkDeadLock(Activity *targetActivity)
  */
 void Activity::waitReserve(RexxInternalObject *resource)
 {
-    // We use the guard semaphore both for waiting to wakeup for guard expression
-    // evaluation and also for obtaining the guard lock
-    guardSem.reset();
+    // Use a dedicated semaphore for scope lock reservation to avoid
+    // spurious wake-ups from guardSem, which can be posted by
+    // RexxVariable::notify() when a guarded variable changes value.
+    // See bug: GUARD ON WHEN allows method to run concurrently.
+    reserveSem.reset();
     waitingObject = resource;
     // release the interpreter lock and wait for access.  Don't continue
     // until we get the lock back
     releaseAccess();
-    waitForGuardPermission();
+    waitForReservePermission();
     requestAccess();
 }
 
@@ -2061,6 +2557,18 @@ void Activity::guardPost()
 {
     waitingObject = OREF_NULL;
     guardSem.post();
+}
+
+
+/**
+ * Post a scope lock reservation wake up notice.
+ * Used by VariableDictionary::release() to wake the next
+ * activity waiting to acquire the scope lock.
+ */
+void Activity::reservePost()
+{
+    waitingObject = OREF_NULL;
+    reserveSem.post();
 }
 
 
@@ -2112,13 +2620,15 @@ void Activity::relinquish()
  */
 void Activity::yield()
 {
-    // get the current rexx frame and request that it yield control
-    RexxActivation *activation = currentRexxFrame;
-    // if we're in the context of Rexx code, request that it yield control
-    if (activation != NULL)
-    {
-        activation->yield();
-    }
+    // Just flag the request.  This is called from a thread other than the one
+    // running this activity, so it must NOT follow currentRexxFrame: the owning
+    // thread rewrites that pointer in updateFrameMarkers() as it pushes and pops
+    // activations, and it is not synchronised with us. Reading it here could hand
+    // back a frame that has already been popped, and writing into that frame
+    // writes into storage the collector may have handed to another object.
+    // The Activity itself is stable, so the request goes here instead, and the
+    // run loop picks it up at the next instruction boundary.
+    yieldRequested.store(true, std::memory_order_relaxed);
 }
 
 
@@ -2138,8 +2648,22 @@ bool Activity::halt(RexxString *d)
 
     if (activation != NULL)
     {
-        // please make it stop :-)
-        return activation->halt(d);
+        // please make it stop :-)  Posted to the activity, not to the frame:
+        // the frame may be ending on its own thread meanwhile (this may run on
+        // another thread), and a flag in an ended frame is never seen.
+        if (haltRequest.load(std::memory_order_acquire))
+        {
+            return false;                   // one still pending
+        }
+        haltRequestDescription = d;
+        // aimed at the top Rexx frame, as before the request was posted to
+        // the activity: native frames above it (a native function, or a
+        // COMMAND method that calls HaltThread()) do not count, or a Rexx
+        // frame pushed later at their depth (CommandContext~FINISH, the
+        // code behind SAY) would take a halt meant for its caller
+        haltRequestDepth = activation->getStackFrameDepth();
+        haltRequest.store(true, std::memory_order_release);
+        return true;
     }
     return true;
 }
@@ -2180,14 +2704,14 @@ bool Activity::setTrace(bool on)
 /**
  * Release exclusive access to the kernel
  */
-void Activity::releaseAccess()
+void Activity::releaseAccess(bool dispatch)
 {
     // make sure we're really the holder on this
     if (ActivityManager::currentActivity == this)
     {
         // reset the numeric settings
         Numerics::setDefaultSettings();
-        ActivityManager::releaseAccess();
+        ActivityManager::releaseAccess(dispatch);
     }
 }
 
@@ -2260,12 +2784,33 @@ void Activity::checkStackSpace()
 /* Function:  Make sure there is enough stack space to run a method           */
 /******************************************************************************/
 {
+// Sanitizer builds add substantial per-frame overhead (redzones, shadow state), so the
+// recursive-descent parser exhausts this budget while parsing the class definitions during
+// image creation, and rexx.img can never be built.  That blocks ASan/TSan/MSan on the
+// interpreter entirely.  Skip the check when building under a sanitizer.  See bugs #2076/#1923.
+//
+// The __has_feature test has to be nested rather than &&-ed onto the line above.  A
+// preprocessor still parses the whole #if expression when the left side is false, and a
+// compiler without __has_feature turns that identifier into 0, leaving 0(address_sanitizer)
+// to be parsed as an expression.  MSVC rejects that outright with C1012.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define ORX_SANITIZER_BUILD
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define ORX_SANITIZER_BUILD
+#endif
+#endif
+
+#ifdef ORX_SANITIZER_BUILD
+    return;
+#else
     // note that we use a size_t variable here to get proper alignment
     size_t temp;                          // if checking and there isn't room
     if ((char *)&temp < stackLimit && stackcheck == true)
     {
         reportException(Error_Control_stack_full);
     }
+#endif
 }
 
 
@@ -3121,6 +3666,39 @@ SecurityManager* Activity::getInstanceSecurityManager()
 
 
 /**
+ * Sends a trace line to the .traceoutput target.
+ */
+class TraceOutputInvoker : public TrapInvoker
+{
+ public:
+    TraceOutputInvoker(RexxObject *s, RexxObject *l) : stream(s), line(l) { }
+
+    void invoke() override
+    {
+        ProtectedObject result;
+        stream->sendMessage(GlobalNames::LINEOUT, line, result);
+    }
+
+ private:
+    RexxObject *stream;
+    RexxObject *line;
+};
+
+
+/**
+ * Runs a TraceOutputInvoker, trapping the errors it raises (not
+ * the other conditions, which behave as they did).
+ */
+class TraceOutputDispatcher : public ConditionTrappingDispatcher
+{
+ public:
+    TraceOutputDispatcher(TrapInvoker &t) : ConditionTrappingDispatcher(t) { }
+
+    bool trapConditions() override { return false; }
+};
+
+
+/**
  * Write out a line of trace output.
  *
  * @param activation The current activation context.
@@ -3138,20 +3716,42 @@ void Activity::traceOutput(RexxActivation *activation, RexxString *line, StringT
 
         RexxObject *stream = getLocalEnvironment(GlobalNames::TRACEOUTPUT);
 
-        if (stream != OREF_NULL && stream != TheNilObject)
+        // The .traceoutput target may be traced itself (a TRACE instruction in
+        // its methods, ::OPTIONS TRACE in their package): every line it writes
+        // would produce more trace lines, recursively, until the C stack runs
+        // out (bug #1871).  So trace lines produced while we are sending one
+        // to the target don't go to the target, but straight to the console.
+        if (stream != OREF_NULL && stream != TheNilObject && !sendingTraceOutput && !(displayingCondition && traceTargetFailed))
         {
-            // need this in case the .traceoutput or the .error monitor
-            // gives us an invalid object with no LINEOUT
-            try
+            // the target can raise an error: it has no LINEOUT, or its LINEOUT
+            // fails.  The error is trapped in a native activation of its own,
+            // so that it unwinds only the frames of the LINEOUT call: a
+            // catch here would leave the frames between the target and the
+            // activation the error was thrown to on the stack
+            Protected<DirectoryClass> failure;
             {
-                ProtectedObject result;
-
-                stream->sendMessage(GlobalNames::LINEOUT, traceObject, result);
+                FlagSetter sending(sendingTraceOutput);
+                TraceOutputInvoker invoker(stream, traceObject);
+                TraceOutputDispatcher dispatcher(invoker);
+                run(dispatcher);
+                failure = dispatcher.getCondition();
             }
-            catch (NativeActivation *)
+            if (!failure.isNull())
             {
                 Protected<RexxString> line = traceObject->requestString();
                 lineOut(line); // don't lose the data!
+                // and raise the error here, where the trace line came from,
+                // unless we are displaying an error: that one goes through
+                // the .traceoutput target too, and would fail again, so the
+                // rest of it goes to the console
+                if (displayingCondition)
+                {
+                    traceTargetFailed = true;
+                }
+                else
+                {
+                    raiseConditionObject(failure);
+                }
             }
         }
         // could not find the target, but don't lose the data!
@@ -3206,12 +3806,20 @@ RexxString* Activity::traceInput(RexxActivation *activation)
         if (stream != OREF_NULL)
         {
             ProtectedObject result;
-            value = (RexxString *)stream->sendMessage(GlobalNames::LINEIN, result);
-            // use a null string of we get .nil back.
-            if (value == (RexxString *)TheNilObject)
+            // the LINEIN of .debuginput can be Rexx code that runs under
+            // interactive trace itself: its debug pauses would read from
+            // .debuginput again, recursively, until the C stack runs out.
+            // While a line is being read, debug pauses are skipped (see
+            // RexxActivation::doDebugPause())
+            RexxObject *line;
             {
-                value = GlobalNames::NULLSTRING;
+                FlagSetter reading(readingDebugInput);
+                line = stream->sendMessage(GlobalNames::LINEIN, result);
             }
+            // use a null string if we get .nil or no value back (LINEIN
+            // can be a Rexx method that ends with a plain RETURN); anything
+            // else is used through its string value
+            value = (line == OREF_NULL || line == TheNilObject) ? GlobalNames::NULLSTRING : line->requestString();
         }
         else
         {
@@ -3242,12 +3850,10 @@ RexxString* Activity::pullInput(RexxActivation *activation)
         if (stream != OREF_NULL)
         {
             ProtectedObject result;
-            value = (RexxString *)stream->sendMessage(GlobalNames::PULL, result);
-            // if we don't get anything from the queue, try again from linein
-            if (value == (RexxString *)TheNilObject)
-            {
-                value = lineIn(activation);
-            }
+            RexxObject *line = stream->sendMessage(GlobalNames::PULL, result);
+            // if we don't get anything from the queue (.nil, or no value
+            // from a PULL that is a Rexx method), try again from linein
+            value = (line == OREF_NULL || line == TheNilObject) ? lineIn(activation) : line->requestString();
         }
     }
     return value;
@@ -3288,12 +3894,9 @@ RexxString* Activity::lineIn(RexxActivation *activation)
         if (stream != OREF_NULL)
         {
             ProtectedObject result;
-            // read using the LINEIN method
-            value = (RexxString *)stream->sendMessage(GlobalNames::LINEIN, result);
-            if (value == (RexxString *)TheNilObject)
-            {
-                value = GlobalNames::NULLSTRING;
-            }
+            // read using the LINEIN method; .nil or no value is a null string
+            RexxObject *line = stream->sendMessage(GlobalNames::LINEIN, result);
+            value = (line == OREF_NULL || line == TheNilObject) ? GlobalNames::NULLSTRING : line->requestString();
         }
         else
         {
@@ -3372,11 +3975,15 @@ void Activity::run(ActivityDispatcher &target)
     // create a new native activation
     NativeActivation *newNActa = ActivityManager::newNativeActivation(this);
     pushStackFrame(newNActa);            /* push it on the activity stack     */
+    // a non-SYNTAX condition RAISEd by the code we run (see
+    // NativeActivation::trapRaised()), for the API caller
+    ProtectedObject calleeCondition;
 
     try
     {
         // go run the target under the new activation
         newNActa->run(target);
+        calleeCondition = newNActa->getCalleeConditionInfo();
     }
     catch (ActivityException)
     {
@@ -3398,11 +4005,18 @@ void Activity::run(ActivityDispatcher &target)
     memoryObject.checkUninitQueue();
     // unwind to the same stack depth as the start, removing all new entries
     unwindToDepth(startDepth);
+    // a HALT requested of a frame of the code we ran, and never taken, ends with
+    // it: it must not halt the next code run on this activity
+    clearHaltRequest();
     // if a condition occurred, make sure we inject this into the API-level
     // native activation so the caller can check to see if an error occurred.
     if (target.conditionData != OREF_NULL)
     {
         getApiContext()->setConditionInfo(target.conditionData);
+    }
+    else if ((RexxObject *)calleeCondition != OREF_NULL && isOfClass(NativeActivation, topStackFrame))
+    {
+        getApiContext()->setCalleeConditionInfo((DirectoryClass *)(RexxObject *)calleeCondition);
     }
     // make sure we clear this from the activity
     clearCurrentCondition();
@@ -3419,8 +4033,11 @@ void Activity::run(ActivityDispatcher &target)
 void Activity::run(CallbackDispatcher &target)
 {
     // create new activation frame using the current Rexx frame (which can be null, but
-    // is not likely to be).
-    NativeActivation *new_activation = ActivityManager::newNativeActivation(this, currentRexxFrame);
+    // is not likely to be).  A command forwarded by a handler written in Rexx
+    // runs as if called from the code that issued it (its variables).
+    RexxActivation *parent = callbackParent != OREF_NULL ? callbackParent : currentRexxFrame;
+    callbackParent = OREF_NULL;
+    NativeActivation *new_activation = ActivityManager::newNativeActivation(this, parent);
     // this becomes the new top activation.  We also turn on the variable pool for
     // this situation.
     pushStackFrame(new_activation);
@@ -3664,4 +4281,89 @@ void Activity::checkRequires(RexxString *name)
     {
         reportException(Error_Execution_circular_requires, name);
     }
+}
+
+
+/**
+ * Report a bad argument of a built-in function, when the check was
+ * delegated to the method that implements the function.  Does nothing
+ * (and the caller raises its method error) unless that function is
+ * running and its frame is the top one.
+ *
+ * @param error  The 40.xxx error: one that takes the function name, the
+ *               argument position and, unless value is NULL, the value.
+ * @param methodPosition
+ *               The argument position for the method.
+ * @param value  The bad value (NULL for a missing argument).
+ */
+void Activity::builtinArgumentError(RexxErrorCodes error, size_t methodPosition, RexxObject *value)
+{
+    if (!inBuiltinFunction())
+    {
+        return;
+    }
+    // the function's target is not a method argument: the method's arguments
+    // are the function's, skipping the target
+    wholenumber_t position = methodPosition < builtinTarget ? methodPosition : methodPosition + 1;
+    if (value == OREF_NULL)
+    {
+        reportException(error, builtinName, position);
+    }
+    reportException(error, builtinName, position, value);
+}
+
+
+/**
+ * Report a bad option of a built-in function (40.904), when the check was
+ * delegated to the method that implements it.  Does nothing unless that
+ * function is running and its frame is the top one.
+ *
+ * @param methodPosition
+ *                The argument position for the method.
+ * @param options The valid options.
+ * @param value   The bad option.
+ */
+void Activity::builtinOptionError(size_t methodPosition, const char *options, RexxObject *value)
+{
+    if (!inBuiltinFunction())
+    {
+        return;
+    }
+    wholenumber_t position = methodPosition < builtinTarget ? methodPosition : methodPosition + 1;
+    reportException(Error_Incorrect_call_list, builtinName, new_integer(position), options, value);
+}
+
+
+/**
+ * Report a bad target of a built-in function (ABS("A")), when the check
+ * was delegated to the method that implements it.  Does nothing unless that
+ * function is running and its frame is the top one.
+ *
+ * @param error  The 40.xxx error (function name, position, value).
+ * @param value  The bad value.
+ */
+void Activity::builtinTargetError(RexxErrorCodes error, RexxObject *value)
+{
+    if (!inBuiltinFunction())
+    {
+        return;
+    }
+    reportException(error, builtinName, (wholenumber_t)builtinTarget, value);
+}
+
+
+// the free-standing forms, for the argument helpers (see ActivityManager.hpp)
+void builtinArgumentError(RexxErrorCodes error, size_t methodPosition, RexxObject *value)
+{
+    ActivityManager::currentActivity.load()->builtinArgumentError(error, methodPosition, value);
+}
+
+void builtinOptionError(size_t methodPosition, const char *options, RexxObject *value)
+{
+    ActivityManager::currentActivity.load()->builtinOptionError(methodPosition, options, value);
+}
+
+void builtinTargetError(RexxErrorCodes error, RexxObject *value)
+{
+    ActivityManager::currentActivity.load()->builtinTargetError(error, value);
 }

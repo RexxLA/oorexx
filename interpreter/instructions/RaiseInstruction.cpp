@@ -50,6 +50,8 @@
 #include "RaiseInstruction.hpp"
 #include "Interpreter.hpp"
 #include "MethodArguments.hpp"
+#include "Activity.hpp"
+#include "ActivityManager.hpp"
 
 
 /**
@@ -189,16 +191,10 @@ void RexxInstructionRaise::execute(RexxActivation *context, ExpressionStack *sta
         _additional = new_array();
         // The description is a null string
         _description = GlobalNames::NULLSTRING;
-        // the RC must have a string value...this is an error if it doesn.
-        RexxString *errorcode = rc->requestString();
-        if (errorcode == TheNilObject)
-        {
-            reportException(Error_Conversion_raise, rc);
-        }
-
         // convert this to decimal, then create an integer object
-        // that we replace the input rc value with
-        wholenumber_t msgNum = Interpreter::messageNumber(errorcode);
+        // that we replace the input rc value with (the errors name
+        // THROW for a THROW)
+        wholenumber_t msgNum = Interpreter::syntaxErrorNumber(rc, instructionFlags[raise_throw]);
         rc = new_integer(msgNum);
     }
 
@@ -291,6 +287,27 @@ void RexxInstructionRaise::execute(RexxActivation *context, ExpressionStack *sta
         }
     }
 
+    // THROW (RFE #31): raised here, and it goes on until something
+    // catches it
+    if (instructionFlags[raise_throw])
+    {
+        throwCondition(context, rc, _description, _additional, conditionobj);
+        return;
+    }
+
+    // RAISE with RETURN or EXIT must not leave a FINALLY clause: it would
+    // replace what is pending with a result of its own.  Translation
+    // rejects it in the clause; this is for interpreted code, and for an
+    // EXIT in an internal routine called from the clause
+    if (instructionFlags[raise_return])
+    {
+        context->checkFinallyExit("RAISE", RexxActivation::FINALLY_SCOPE_CODE);
+    }
+    else if (instructionFlags[raise_exit])
+    {
+        context->checkFinallyExit("RAISE", RexxActivation::FINALLY_SCOPE_BODY);
+    }
+
     // we have two forms, both of which are handled by context
     // raise return is processed as a return instruction
     if (instructionFlags[raise_return])
@@ -304,3 +321,51 @@ void RexxInstructionRaise::execute(RexxActivation *context, ExpressionStack *sta
     }
 }
 
+
+/**
+ * Throw the condition of a THROW instruction (RFE #31).  This does not
+ * return.
+ *
+ * @param context The current execution context.
+ * @param rc      The RC value (ERROR, FAILURE and SYNTAX).
+ * @param _description
+ *                The DESCRIPTION, if given.
+ * @param _additional
+ *                The ADDITIONAL information, if given.
+ * @param conditionobj
+ *                For THROW PROPAGATE, the condition being handled.
+ */
+void RexxInstructionRaise::throwCondition(RexxActivation *context, RexxObject *rc, RexxString *_description,
+    RexxObject *_additional, DirectoryClass *conditionobj)
+{
+    Activity *activity = ActivityManager::currentActivity;
+    Protected<DirectoryClass> condition = conditionobj;
+
+    // THROW PROPAGATE: the condition being handled, raised or thrown, with
+    // DESCRIPTION and ADDITIONAL replaced if they are given, as in RAISE
+    // PROPAGATE
+    if (instructionFlags[raise_propagate])
+    {
+        if (description != OREF_NULL)
+        {
+            condition->put(_description, GlobalNames::DESCRIPTION);
+        }
+        if (_additional != OREF_NULL)
+        {
+            condition->put(_additional, GlobalNames::ADDITIONAL);
+        }
+        RexxString *name = (RexxString *)condition->get(GlobalNames::CONDITION);
+        // the message of an error is built from its ADDITIONAL
+        if (name->strCompare(GlobalNames::SYNTAX) && _additional != OREF_NULL)
+        {
+            activity->completeSyntaxCondition(condition);
+        }
+        activity->throwCondition(condition);
+    }
+    // a new condition, as the Throw() API throws it (THROW SYNTAX is an
+    // error, as RAISE SYNTAX raises it)
+    else
+    {
+        activity->throwNewCondition(conditionName, rc, _description, _additional);
+    }
+}

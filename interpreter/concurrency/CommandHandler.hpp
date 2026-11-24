@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2018 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -55,7 +55,8 @@ namespace HandlerType
         UNRESOLVED,           // UNRESOLVED -- a handler that we cannot resolve from the registry
         REGISTERED_NAME,      // a registered named environment
         DIRECT,               // a direct, exit based call
-        REDIRECTING           // a handler that supports I/O redirection.
+        REDIRECTING,          // a handler that supports I/O redirection.
+        REXX_OBJECT           // a Rexx object (.CommandHandler~register): no native code
     };
 };
 
@@ -70,17 +71,33 @@ public:
     inline void  operator delete(void *) { ; }
 
     inline CommandHandler(RESTORETYPE restoreType) { ; };
-    inline CommandHandler(REXXPFN e, HandlerType::Enum t) : entryPoint(e), type(t) { ; }
-    inline CommandHandler(const char *n) : entryPoint(NULL) { type = HandlerType::UNRESOLVED; resolve(n); }
+    inline CommandHandler(REXXPFN e, HandlerType::Enum t) : entryPoint(e), type(t), handlerObject(OREF_NULL), wrapper(OREF_NULL), previous(OREF_NULL) { ; }
+    inline CommandHandler(RexxObject *h) : entryPoint(NULL), type(HandlerType::REXX_OBJECT), handlerObject(h), wrapper(OREF_NULL), previous(OREF_NULL) { ; }
+
+    void live(size_t) override;
+    void liveGeneral(MarkReason reason) override;
 
     void call(Activity *activity, RexxActivation *activation, RexxString *address, RexxString *command, ProtectedObject &rc, ProtectedObject &condition, CommandIOContext *io);
-    void resolve(const char *name);
+    static REXXPFN resolveRegisteredName(const char *name);
     inline bool isResolved() { return type != HandlerType::UNRESOLVED; }
+    inline bool isRexxObject() { return type == HandlerType::REXX_OBJECT; }
+    inline RexxObject *getHandlerObject() { return handlerObject; }
+    RexxObject *getRexxObject(RexxString *name);
+    inline CommandHandler *getPrevious() { return previous; }
+    inline void setPrevious(CommandHandler *p) { setField(previous, p); }
+    inline bool isRegisteredName() { return type == HandlerType::REGISTERED_NAME; }
+    void callForwarded(Activity *activity, RexxActivation *activation, RexxString *address, RexxString *command, ProtectedObject &rc, ProtectedObject &condition, CommandIOContext *io);
+    const char *kindName();
 
 protected:
 
+    void callRexxObject(Activity *activity, RexxActivation *activation, RexxString *address, RexxString *command, ProtectedObject &rc, ProtectedObject &condition, CommandIOContext *io);
+
     REXXPFN    entryPoint;             // resolved exit entry point
     HandlerType::Enum   type;          // the type of call
+    RexxObject *handlerObject;         // the Rexx object of a REXX_OBJECT handler
+    RexxObject *wrapper;               // the .NativeCommandHandler of a native one
+    CommandHandler *previous;          // the handler this one covers (register stacks)
 };
 
 

@@ -1,6 +1,6 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
-/* Copyright (c) 2008-2024 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2008-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -1909,6 +1909,83 @@ RexxMethod2(RexxObjectPtr,
     return context->CallRoutine((RexxRoutineObject)routine, args);
 }
 
+// call a routine and report the condition it left, as an array:
+// result (or .nil), CheckCondition(), and the condition, description and
+// additional of GetConditionInfo() (or .nil); the condition is not cleared
+RexxMethod2(RexxObjectPtr,
+            TestCallRoutineCondition,
+            RexxObjectPtr, routine,
+            RexxArrayObject, args)
+{
+    RexxObjectPtr result = context->CallRoutine((RexxRoutineObject)routine, args);
+    RexxArrayObject report = context->NewArray(5);
+    context->ArrayPut(report, result != NULLOBJECT ? result : context->Nil(), 1);
+    context->ArrayPut(report, context->Logical(context->CheckCondition()), 2);
+    RexxDirectoryObject info = context->GetConditionInfo();
+    const char *items[] = { "CONDITION", "DESCRIPTION", "ADDITIONAL" };
+    for (size_t i = 0; i < 3; i++)
+    {
+        RexxObjectPtr item = info != NULLOBJECT ? context->DirectoryAt(info, items[i]) : NULLOBJECT;
+        context->ArrayPut(report, item != NULLOBJECT ? item : context->Nil(), i + 3);
+    }
+    return report;
+}
+
+// call a routine and return the condition object it left (.nil if none),
+// cleared, so that it is not raised again when this method returns
+RexxMethod2(RexxObjectPtr,
+            TestCallRoutineConditionObject,
+            RexxObjectPtr, routine,
+            RexxArrayObject, args)
+{
+    context->CallRoutine((RexxRoutineObject)routine, args);
+    RexxDirectoryObject info = context->GetConditionInfo();
+    context->ClearCondition();
+    return info != NULLOBJECT ? (RexxObjectPtr)info : context->Nil();
+}
+
+// send a message and report what this method context sees right after it, as
+// an array: whether a condition is pending, the condition object (.nil if
+// none) and the result (.nil if none); the condition is cleared, so that it is
+// not raised again when this method returns
+RexxMethod3(RexxObjectPtr,
+            TestSendMessageConditionObject,
+            RexxObjectPtr, target,
+            CSTRING, name,
+            RexxArrayObject, args)
+{
+    RexxObjectPtr result = context->SendMessage(target, name, args);
+    logical_t pending = context->CheckCondition();
+    RexxDirectoryObject info = context->GetConditionInfo();
+    context->ClearCondition();
+    RexxArrayObject report = context->NewArray(3);
+    context->ArrayPut(report, context->Logical(pending), 1);
+    context->ArrayPut(report, info != NULLOBJECT ? (RexxObjectPtr)info : context->Nil(), 2);
+    context->ArrayPut(report, result != NULLOBJECT ? result : context->Nil(), 3);
+    return report;
+}
+
+// decode a condition object with DecodeConditionInfo and report it, as an
+// array: the condition name, code, rc, description and additional (.nil when
+// not given), and whether decoding left a condition pending
+RexxMethod1(RexxObjectPtr,
+            TestDecodeCondition,
+            RexxObjectPtr, condition)
+{
+    RexxCondition cd;
+    context->DecodeConditionInfo((RexxDirectoryObject)condition, &cd);
+    RexxArrayObject report = context->NewArray(6);
+    context->ArrayPut(report, cd.conditionName != NULLOBJECT ? (RexxObjectPtr)cd.conditionName : context->Nil(), 1);
+    context->ArrayPut(report, context->WholeNumber(cd.code), 2);
+    context->ArrayPut(report, context->WholeNumber(cd.rc), 3);
+    context->ArrayPut(report, cd.description != NULLOBJECT ? (RexxObjectPtr)cd.description : context->Nil(), 4);
+    context->ArrayPut(report, cd.additional != NULLOBJECT ? (RexxObjectPtr)cd.additional : context->Nil(), 5);
+    context->ArrayPut(report, context->Logical(context->CheckCondition()), 6);
+    // a condition left by decoding would otherwise be raised in the caller
+    context->ClearCondition();
+    return report;
+}
+
 RexxMethod2(RexxObjectPtr,
             TestCallProgram,
             CSTRING, name,
@@ -2113,10 +2190,84 @@ RexxMethod4(int,
             OPTIONAL_RexxArrayObject, add,
             OPTIONAL_RexxObjectPtr, result)
 {
-    context->RaiseCondition(name, (RexxStringObject)desc, add, result);
+    // desc is a C string: it must be passed as a String object
+    context->RaiseCondition(name, desc == NULL ? NULLOBJECT : context->String(desc), add, result);
     // this should still get executed
     context->SetObjectVariable("CONTINUE", context->True());
     return 0;
+}
+
+RexxMethod1(int,
+            TestRaiseConditionObject,
+            OPTIONAL_RexxObjectPtr, condition)
+{
+    context->RaiseConditionObject((RexxDirectoryObject)condition);
+    // this should still get executed
+    context->SetObjectVariable("CONTINUE", context->True());
+    return 0;
+}
+
+// ThrowObject() (RFE #31): throws a copy of the condition object, and
+// returns; the condition is thrown when the native method returns
+RexxMethod1(int,
+            TestThrowObject,
+            OPTIONAL_RexxObjectPtr, condition)
+{
+    context->ThrowObject((RexxDirectoryObject)condition);
+    // this should still get executed
+    context->SetObjectVariable("CONTINUE", context->True());
+    return 0;
+}
+
+// what a bridge does to pass a thrown condition through: call Rexx code and
+// throw any condition it threw again in our caller, raising the others
+RexxMethod2(RexxObjectPtr,
+            TestCallRoutineAndRethrow,
+            RexxObjectPtr, routine,
+            OPTIONAL_RexxArrayObject, args)
+{
+    if (args == NULLOBJECT)
+    {
+        args = context->NewArray(0);
+    }
+    RexxObjectPtr result = context->CallRoutine((RexxRoutineObject)routine, args);
+    if (context->CheckCondition())
+    {
+        RexxDirectoryObject condition = context->GetConditionInfo();
+        context->ClearCondition();
+        if (context->DirectoryAt(condition, "THROWN") == context->True())
+        {
+            context->ThrowObject(condition);
+        }
+        else
+        {
+            context->RaiseConditionObject(condition);
+        }
+        return NULLOBJECT;
+    }
+    return result;
+}
+
+// what a bridge does: call Rexx code and raise any condition it raised
+// again in our caller
+RexxMethod2(RexxObjectPtr,
+            TestCallRoutineAndReraise,
+            RexxObjectPtr, routine,
+            OPTIONAL_RexxArrayObject, args)
+{
+    if (args == NULLOBJECT)
+    {
+        args = context->NewArray(0);
+    }
+    RexxObjectPtr result = context->CallRoutine((RexxRoutineObject)routine, args);
+    if (context->CheckCondition())
+    {
+        RexxDirectoryObject condition = context->GetConditionInfo();
+        context->ClearCondition();
+        context->RaiseConditionObject(condition);
+        return NULLOBJECT;
+    }
+    return result;
 }
 
 RexxMethod1(int,
@@ -2170,7 +2321,23 @@ RexxMethod4(int,
             OPTIONAL_RexxArrayObject, add,
             OPTIONAL_RexxObjectPtr, result)
 {
-    context->ThrowCondition(name, (RexxStringObject)desc, add, result);
+    // desc is a C string: it must be passed as a String object
+    context->ThrowCondition(name, desc == NULL ? NULLOBJECT : context->String(desc), add, result);
+    // this should never execute
+    context->SetObjectVariable("CONTINUE", context->True());
+    return 0;
+}
+
+// Throw() (RFE #31): as the THROW instruction.  The arguments are passed as
+// they come, so that the tests can check how Throw() rejects bad ones
+RexxMethod4(int,
+            TestThrow,
+            OPTIONAL_CSTRING, name,
+            OPTIONAL_RexxObjectPtr, rc,
+            OPTIONAL_RexxObjectPtr, desc,
+            OPTIONAL_RexxObjectPtr, add)
+{
+    context->Throw(name, rc, (RexxStringObject)desc, add);
     // this should never execute
     context->SetObjectVariable("CONTINUE", context->True());
     return 0;
@@ -2465,6 +2632,15 @@ RexxMethod1(RexxObjectPtr,
 
 
 
+RexxMethod2(int, TestHaltThreadCommand, RexxStringObject, command, RexxObjectPtr, caller)
+{
+    // a COMMAND method of a .CommandHandler that asks for a halt of the
+    // issuer with HaltThread() and returns RC 5 (bug #2124)
+    context->threadContext->HaltThread();
+    return 5;
+}
+
+
 RexxMethodEntry orxtest_methods[] = {
     REXX_METHOD(TestIsBuffer,          TestIsBuffer),
     REXX_METHOD(TestBufferInit,        TestBufferInit),
@@ -2662,6 +2838,10 @@ RexxMethodEntry orxtest_methods[] = {
     REXX_METHOD(TestGetPackagePublicClasses, TestGetPackagePublicClasses),
     REXX_METHOD(TestGetPackageMethods,       TestGetPackageMethods),
     REXX_METHOD(TestCallRoutine,             TestCallRoutine),
+    REXX_METHOD(TestCallRoutineCondition,    TestCallRoutineCondition),
+    REXX_METHOD(TestCallRoutineConditionObject, TestCallRoutineConditionObject),
+    REXX_METHOD(TestSendMessageConditionObject, TestSendMessageConditionObject),
+    REXX_METHOD(TestDecodeCondition,         TestDecodeCondition),
     REXX_METHOD(TestCallProgram,             TestCallProgram),
     REXX_METHOD(TestNewMethod,               TestNewMethod),
     REXX_METHOD(TestNewRoutine,              TestNewRoutine),
@@ -2681,6 +2861,10 @@ RexxMethodEntry orxtest_methods[] = {
     REXX_METHOD(TestRaiseException2,         TestRaiseException2),
     REXX_METHOD(TestRaiseException,          TestRaiseException),
     REXX_METHOD(TestRaiseCondition,          TestRaiseCondition),
+    REXX_METHOD(TestRaiseConditionObject,    TestRaiseConditionObject),
+    REXX_METHOD(TestThrowObject,             TestThrowObject),
+    REXX_METHOD(TestCallRoutineAndRethrow,   TestCallRoutineAndRethrow),
+    REXX_METHOD(TestCallRoutineAndReraise,   TestCallRoutineAndReraise),
     REXX_METHOD(TestInterpreterVersion,      TestInterpreterVersion),
     REXX_METHOD(TestLanguageLevel,           TestLanguageLevel),
     REXX_METHOD(TestNewStringFromAsciiz,     TestNewStringFromAsciiz),
@@ -2712,11 +2896,13 @@ RexxMethodEntry orxtest_methods[] = {
     REXX_METHOD(TestThrowException2,         TestThrowException2),
     REXX_METHOD(TestThrowException,          TestThrowException),
     REXX_METHOD(TestThrowCondition,          TestThrowCondition),
+    REXX_METHOD(TestThrow,                   TestThrow),
     REXX_METHOD(TestSetGuard,                TestSetGuard),
     REXX_METHOD(TestSetGuardOn,              TestSetGuardOn),
     REXX_METHOD(TestSetGuardOff,             TestSetGuardOff),
     REXX_METHOD(TestSetGuardOnWhenUpdated,   TestSetGuardOnWhenUpdated),
     REXX_METHOD(TestSetGuardOffWhenUpdated,  TestSetGuardOffWhenUpdated),
+    REXX_METHOD(TestHaltThreadCommand,       TestHaltThreadCommand),
     REXX_LAST_METHOD()
 };
 

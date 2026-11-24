@@ -1248,6 +1248,7 @@ Section "${LONGNAME} Documentation" SecDoc
   ${File} "${SRCDIR}\extensions\platform\windows\oodialog\" "ooDialog_ReleaseNotes.txt"
   ${File} "${DOCDIR}\" "oodguide.pdf"
   ${File} "${DOCDIR}\" "rexxextensions.pdf"
+  ${File} "${DOCDIR}\" "rexxparser.pdf"
   ${File} "${DOCDIR}\" "winextensions.pdf"
   ${File} "${SRCDIR}\samples\windows\oodialog\ooRexxTry\doc\" "ooRexxTry.pdf"
 
@@ -1279,6 +1280,8 @@ Section "${LONGNAME} Documentation" SecDoc
   ${AddItem} "$SMPROGRAMS\${LONGNAME}\${SHORTNAME} Documentation\ooDialog User Guide.lnk"
   CreateShortCut "$SMPROGRAMS\${LONGNAME}\${SHORTNAME} Documentation\ooRexx Rexx Extensions Reference.lnk" "$INSTDIR\doc\rexxextensions.pdf" "" "$INSTDIR\doc\rexxextensions.pdf" 0
   ${AddItem} "$SMPROGRAMS\${LONGNAME}\${SHORTNAME} Documentation\ooRexx Rexx Extensions Reference.lnk"
+  CreateShortCut "$SMPROGRAMS\${LONGNAME}\${SHORTNAME} Documentation\ooRexx Rexx Parser Reference.lnk" "$INSTDIR\doc\rexxparser.pdf" "" "$INSTDIR\doc\rexxparser.pdf" 0
+  ${AddItem} "$SMPROGRAMS\${LONGNAME}\${SHORTNAME} Documentation\ooRexx Rexx Parser Reference.lnk"
   CreateShortCut "$SMPROGRAMS\${LONGNAME}\${SHORTNAME} Documentation\ooRexx Unix Extensions Reference.lnk" "$INSTDIR\doc\unixextensions.pdf" "" "$INSTDIR\doc\unixextensions.pdf" 0
   ${AddItem} "$SMPROGRAMS\${LONGNAME}\${SHORTNAME} Documentation\ooRexx Unix Extensions Reference.lnk"
   CreateShortCut "$SMPROGRAMS\${LONGNAME}\${SHORTNAME} Documentation\ooRexx Windows Extensions Reference.lnk" "$INSTDIR\doc\winextensions.pdf" "" "$INSTDIR\doc\winextensions.pdf" 0
@@ -1896,7 +1899,7 @@ Function Components_Page_pre
 
   StrCpy $CheckRxApiLock 'false'
   Call CheckLockedFiles
-  ${If} $$UserRequestAbort == 'true'
+  ${If} $UserRequestAbort == 'true'
     Quit
   ${EndIf}
 
@@ -3316,6 +3319,14 @@ FunctionEnd
 Function CheckLockedFiles
 
   StrCpy $UserRequestAbort 'false'
+
+  ; With no previous installation there is no location, and the key file
+  ; names below would be relative to the root of the current drive.  When the
+  ; installer runs from a read-only network share, those can not be opened
+  ; for writing, and LockedList reports them as locked (bug #1629).
+  ${If} $RegVal_uninstallLocation == ""
+    goto done_out
+  ${EndIf}
 
 check_lock_loop:
 

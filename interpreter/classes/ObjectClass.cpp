@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2022 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -590,10 +590,13 @@ RexxInternalObject *RexxObject::copy()
  */
 void RexxObject::copyObjectVariables(RexxObject *newObj)
 {
-    // copy the complete variable set if we have something
+    // copy the complete variable set if we have something.  The copy goes
+    // to the new object, which was cloned with our dictionaries; ours stay
+    // as they are (methods of ours that are running use them, and we might
+    // be in old space, where a new reference needs the write barrier)
     if (objectVariables != OREF_NULL)
     {
-        objectVariables = objectVariables->deepCopy();
+        setOtherField(newObj, objectVariables, objectVariables->deepCopy());
     }
 }
 
@@ -609,7 +612,7 @@ void RexxObject::copyObjectVariables(RexxObject *newObj)
 MethodClass *RexxObject::checkPrivate(MethodClass *method, RexxErrorCodes &error)
 {
     // get the calling activation context
-    ActivationBase *activation = ActivityManager::currentActivity->getTopStackFrame();
+    ActivationBase *activation = ActivityManager::currentActivity.load()->getTopStackFrame();
     if (activation != OREF_NULL)
     {
         // if the sending and receiving object are the same, this is allowed.
@@ -659,7 +662,7 @@ MethodClass *RexxObject::checkPrivate(MethodClass *method, RexxErrorCodes &error
 MethodClass *RexxObject::checkPackage(MethodClass *method, RexxErrorCodes &error )
 {
     // get the calling activation context
-    ActivationBase *activation = ActivityManager::currentActivity->getTopStackFrame();
+    ActivationBase *activation = ActivityManager::currentActivity.load()->getTopStackFrame();
 
     // likely a topLevel call via SendMessage() API which is contextless.
     if (activation == OREF_NULL)
@@ -697,7 +700,7 @@ MethodClass *RexxObject::checkPackage(MethodClass *method, RexxErrorCodes &error
 void RexxObject::checkRestrictedMethod(const char *methodName)
 {
     // get the calling activation context
-    ActivationBase *activation = ActivityManager::currentActivity->getTopStackFrame();
+    ActivationBase *activation = ActivityManager::currentActivity.load()->getTopStackFrame();
     if (activation != OREF_NULL)
     {
         // Unlike private methods, this is only allowed from the instance, or from
@@ -866,7 +869,7 @@ RexxObject *RexxObject::sendMessage(RexxString *message, RexxObject *argument1, 
 RexxObject *RexxObject::messageSend(RexxString *msgname, RexxObject **arguments, size_t  count, ProtectedObject &result)
 {
     // check for a control stack condition
-    ActivityManager::currentActivity->checkStackSpace();
+    ActivityManager::currentActivity.load()->checkStackSpace();
     // see if we have a method defined
     MethodClass *method_save = behaviour->methodLookup(msgname);
 
@@ -923,7 +926,7 @@ RexxObject *RexxObject::messageSend(RexxString *msgname, RexxObject **arguments,
     validateScopeOverride(startscope);
 
     // perform a stack space check
-    ActivityManager::currentActivity->checkStackSpace();
+    ActivityManager::currentActivity.load()->checkStackSpace();
 
     // do the lookup using the starting scope
     MethodClass *method_save = superMethod(msgname, startscope);
@@ -977,7 +980,7 @@ void RexxObject::processProtectedMethod(RexxString *messageName, MethodClass *ta
     RexxObject  **arguments, size_t count, ProtectedObject &result)
 {
     // get the current security manager
-    SecurityManager *manager = ActivityManager::currentActivity->getEffectiveSecurityManager();
+    SecurityManager *manager = ActivityManager::currentActivity.load()->getEffectiveSecurityManager();
     // the security manager can provide a new result
     if (manager->checkProtectedMethod(this, messageName, count, arguments, result))
     {
@@ -1133,6 +1136,43 @@ NumberString * RexxInternalObject::numberString()
 
 
 /**
+ * Check the answer of a method that should give a string value (REQUEST,
+ * STRING, OBJECTNAME, MAKESTRING, which can all be Rexx methods) and force
+ * it to a primitive string.
+ *
+ * @param answer The answer, possibly OREF_NULL.
+ *
+ * @return The primitive string, or .nil if there was no answer or the
+ *         answer has no primitive string value.
+ */
+static RexxString *primitiveStringOrNil(RexxInternalObject *answer)
+{
+    return answer == OREF_NULL ? (RexxString *)TheNilObject : answer->primitiveMakeString();
+}
+
+
+/**
+ * Check the answer of a STRING method.  Besides what
+ * primitiveStringOrNil() accepts, an object that converts through the
+ * request mechanism (it has a MAKESTRING method) is accepted too.
+ *
+ * @param answer The answer, possibly OREF_NULL.
+ *
+ * @return The primitive string, or .nil if there was no acceptable answer.
+ */
+static RexxString *stringAnswerOrNil(RexxInternalObject *answer)
+{
+    RexxString *string_value = primitiveStringOrNil(answer);
+    // one level only: makeString() checks what REQUEST answers itself
+    if (string_value == TheNilObject && answer != OREF_NULL && !answer->isBaseClass())
+    {
+        string_value = answer->makeString();
+    }
+    return string_value;
+}
+
+
+/**
  * Convert a primitive internal object to a string value
  *
  * @return The string value of the internal object, which is always
@@ -1157,7 +1197,15 @@ RexxString *RexxInternalObject::stringValue()
 RexxString *RexxObject::stringValue()
 {
     ProtectedObject result;
-    return (RexxString *)sendMessage(GlobalNames::OBJECTNAME, result);
+    sendMessage(GlobalNames::OBJECTNAME, result);
+    // OBJECTNAME can be redefined: an answer that is no value or has no
+    // string value gives the default name, which needs no method
+    RexxString *name = primitiveStringOrNil((RexxInternalObject *)result);
+    if (name == TheNilObject)
+    {
+        return defaultName();
+    }
+    return name;
 }
 
 
@@ -1188,7 +1236,10 @@ RexxString *RexxInternalObject::makeString()
     else
     {
         ProtectedObject result;
-        return (RexxString *)resultOrNil(((RexxObject *)this)->sendMessage(GlobalNames::REQUEST, GlobalNames::STRING, result));
+        ((RexxObject *)this)->sendMessage(GlobalNames::REQUEST, GlobalNames::STRING, result);
+        // REQUEST can be redefined: an answer that is no value or has no
+        // string value does not convert
+        return primitiveStringOrNil((RexxInternalObject *)result);
     }
 }
 
@@ -1244,7 +1295,7 @@ RexxString *RexxInternalObject::requestString()
             // get the ultimate, really needs to return a string string value for raising the condition.
             string_value = stringValue();
             // and raise nostring.  If not trapped, this returns here and we return the final string value as a result.
-            ActivityManager::currentActivity->raiseCondition(GlobalNames::NOSTRING, OREF_NULL, string_value, (RexxObject *)this, OREF_NULL);
+            ActivityManager::currentActivity.load()->raiseCondition(GlobalNames::NOSTRING, OREF_NULL, string_value, (RexxObject *)this, OREF_NULL);
         }
         return string_value;
     }
@@ -1255,36 +1306,27 @@ RexxString *RexxInternalObject::requestString()
 
         ((RexxObject *)this)->sendMessage(GlobalNames::REQUEST, GlobalNames::STRING, string_value);
         // The returned value might be an Integer or NumberString value.  We need to
-        // force this to be a real string value.
-        string_value = ((RexxObject *)string_value)->primitiveMakeString();
+        // force this to be a real string value.  REQUEST can be redefined: no
+        // value, or an answer with no string value, means it did not convert.
+        string_value = primitiveStringOrNil((RexxInternalObject *)string_value);
 
         // if this did not convert, we send the STRING message to get a value
         if ((RexxObject *)string_value == TheNilObject)
         {
             ((RexxObject *)this)->sendMessage(GlobalNames::STRING, string_value);
             // we're really dependent upon the program respecting the protocol
-            // here and returning a value.  It is possible there is a
-            // problem, so how to handle this.  We could just raise an error, but this
-            // isn't the most ideal message since the error is raised at the
-            // line where the string value is required, but this is a rare
-            // situation.  As a fallback, use the default object STRING method,
-            // then raise an error if we still don't get anything.  This at least
-            // keeps the interpreter from crashing, there's a good chance the
-            // program will run.  Frankly, there's something seriously wrong
-            // if this error ever gets issued.
-            if (((RexxObject *)string_value) == OREF_NULL)
+            // here and returning a string value.  When it does not (no value,
+            // or an object with no string value), we use the default STRING,
+            // and in the end the default name.  Raising an error here is not
+            // a good idea: we may be building a trace line or an error message.
+            string_value = stringAnswerOrNil((RexxInternalObject *)string_value);
+            if ((RexxObject *)string_value == TheNilObject)
             {
+                // this always gives a string (the default name in the end)
                 string_value = stringValue();
-                if (((RexxObject *)string_value) == OREF_NULL)
-                {
-                    reportException(Error_No_result_object_message, GlobalNames::STRING);
-                }
             }
-            // The returned value might be an Integer or NumberString value.  We need to
-            // force this to be a real string value.
-            string_value = ((RexxObject *)string_value)->primitiveMakeString();
             // raise a NOSTRING condition
-            ActivityManager::currentActivity->raiseCondition(GlobalNames::NOSTRING, OREF_NULL, (RexxString *)string_value, (RexxObject *)this, OREF_NULL);
+            ActivityManager::currentActivity.load()->raiseCondition(GlobalNames::NOSTRING, OREF_NULL, (RexxString *)string_value, (RexxObject *)this, OREF_NULL);
         }
         // we finally have a string value of some sort.
         return (RexxString *)string_value;
@@ -1319,12 +1361,17 @@ RexxString *RexxInternalObject::requestStringNoNOSTRING()
         // have to do this via message sends
         ProtectedObject string_value;
         ((RexxObject *)this)->sendMessage(GlobalNames::REQUEST, GlobalNames::STRING, string_value);
+        // the same checks as requestString()
+        string_value = primitiveStringOrNil((RexxInternalObject *)string_value);
         if ((RexxObject *)string_value == TheNilObject)
         {
             ((RexxObject *)this)->sendMessage(GlobalNames::STRING, string_value);
+            string_value = stringAnswerOrNil((RexxInternalObject *)string_value);
+            if ((RexxObject *)string_value == TheNilObject)
+            {
+                string_value = stringValue();
+            }
         }
-
-        // we better get something here.
         return (RexxString *)string_value;
     }
 }
@@ -1568,6 +1615,7 @@ size_t RexxInternalObject::requiredPositive(size_t position, wholenumber_t preci
     // convert and validate the result
     if (!unsignedNumberValue(result, precision) || result == 0)
     {
+        builtinArgumentError(Error_Incorrect_call_positive, position, (RexxObject *)this);
         reportException(Error_Incorrect_method_positive, position, (RexxObject *)this);
     }
     return result;
@@ -1611,6 +1659,7 @@ size_t RexxInternalObject::requiredNonNegative(size_t position, wholenumber_t pr
 
     if (!unsignedNumberValue(result, precision))
     {
+        builtinArgumentError(Error_Incorrect_call_nonnegative, position, (RexxObject *)this);
         reportException(Error_Incorrect_method_nonnegative, position, (RexxObject *)this);
     }
     return result;
@@ -1662,7 +1711,15 @@ ArrayClass *RexxInternalObject::requestArray()
     else
     {
         ProtectedObject result;
-        return(ArrayClass *)resultOrNil(((RexxObject *)this)->sendMessage(GlobalNames::REQUEST, GlobalNames::ARRAY, result));
+        RexxObject *answer = resultOrNil(((RexxObject *)this)->sendMessage(GlobalNames::REQUEST, GlobalNames::ARRAY, result));
+        // REQUEST and MAKEARRAY can be user methods, and they can answer
+        // anything.  Only an Array can be used as one: anything else did not
+        // convert.
+        if (!answer->isInstanceOf(TheArrayClass))
+        {
+            return (ArrayClass *)TheNilObject;
+        }
+        return (ArrayClass *)answer;
     }
 }
 

@@ -1,7 +1,7 @@
 /*----------------------------------------------------------------------------*/
 /*                                                                            */
 /* Copyright (c) 1995, 2004 IBM Corporation. All rights reserved.             */
-/* Copyright (c) 2005-2025 Rexx Language Association. All rights reserved.    */
+/* Copyright (c) 2005-2026 Rexx Language Association. All rights reserved.    */
 /*                                                                            */
 /* This program and the accompanying materials are made available under       */
 /* the terms of the Common Public License v1.0 which accompanies this         */
@@ -164,6 +164,7 @@
 #include "RexxUtilCommon.hpp"
 #include "Utilities.hpp"
 #include "RexxInternalApis.h"
+#include "SysFile.hpp"                // HOST_ERRNO
 
 #if defined __APPLE__
 #define open64 open
@@ -584,7 +585,7 @@ RexxRoutine2(int, SysMkDir, CSTRING, path, OPTIONAL_int32_t, mode)
     {
         mode = S_IRWXU | S_IRWXG | S_IRWXO;
     }
-    return mkdir(qualifiedName, mode) == 0 ? 0 : errno;
+    return mkdir(qualifiedName, mode) == 0 ? 0 : HOST_ERRNO(errno);
 }
 
 
@@ -623,7 +624,120 @@ typedef struct RxSemData
 {
      bool          named;               /* Named semaphore?           */
      sem_t *handle;              /* Semaphore pointer          */
+     struct RxSemData *next;     /* next live semaphore        */
 } RXSEMDATA;
+
+
+/*************************************************************************
+* The handle a program gets is the address of its RXSEMDATA.  A handle   *
+* that was closed, rounded by arithmetic or made up would be used as an  *
+* address and crash, so every live semaphore is kept in a list, and a    *
+* handle is only used if it is one of them (the list is searched by      *
+* value, a handle is never dereferenced before it is found).             *
+*************************************************************************/
+
+static RXSEMDATA *liveSemaphores = NULL;
+static pthread_mutex_t liveSemaphoresLock = PTHREAD_MUTEX_INITIALIZER;
+
+
+/**
+ * Add a newly created or opened semaphore to the live list.
+ *
+ * @param semdata The semaphore data.
+ *
+ * @return The handle to give back to the program.
+ */
+static uintptr_t registerSemaphore(RXSEMDATA *semdata)
+{
+    pthread_mutex_lock(&liveSemaphoresLock);
+    semdata->next = liveSemaphores;
+    liveSemaphores = semdata;
+    pthread_mutex_unlock(&liveSemaphoresLock);
+    return (uintptr_t)semdata;
+}
+
+
+/**
+ * Find a live semaphore by its handle.  The caller must hold
+ * liveSemaphoresLock.
+ *
+ * @param vhandle The handle given by the program.
+ *
+ * @return The semaphore data, or NULL if the handle names no live semaphore.
+ */
+static RXSEMDATA *findSemaphoreLocked(uintptr_t vhandle)
+{
+    for (RXSEMDATA *semdata = liveSemaphores; semdata != NULL; semdata = semdata->next)
+    {
+        if ((uintptr_t)semdata == vhandle)
+        {
+            return semdata;
+        }
+    }
+    return NULL;
+}
+
+
+/**
+ * Find a live semaphore by its handle.
+ *
+ * @param vhandle The handle given by the program.
+ *
+ * @return The semaphore data, or NULL if the handle names no live semaphore.
+ */
+static RXSEMDATA *findSemaphore(uintptr_t vhandle)
+{
+    pthread_mutex_lock(&liveSemaphoresLock);
+    RXSEMDATA *semdata = findSemaphoreLocked(vhandle);
+    pthread_mutex_unlock(&liveSemaphoresLock);
+    return semdata;
+}
+
+
+/**
+ * Close a semaphore and, if that worked, remove it from the live list and
+ * free it.  Shared by SysCloseEventSem and SysCloseMutexSem.
+ *
+ * @param vhandle The handle given by the program.
+ *
+ * @return 0, 6 if the handle names no live semaphore, or 102.
+ */
+static int closeSemaphore(uintptr_t vhandle)
+{
+    pthread_mutex_lock(&liveSemaphoresLock);
+    RXSEMDATA *semdata = findSemaphoreLocked(vhandle);
+    if (semdata == NULL)
+    {
+        pthread_mutex_unlock(&liveSemaphoresLock);
+        return 6;
+    }
+
+    // an unnamed semaphore is destroyed, a named one is closed
+    int rc = semdata->named ? sem_close(semdata->handle) : sem_destroy(semdata->handle);
+    if (rc != 0)
+    {
+        int error = errno;
+        pthread_mutex_unlock(&liveSemaphoresLock);
+        return error == EINVAL ? 6 : 102;
+    }
+
+    // unchain it
+    RXSEMDATA **link = &liveSemaphores;
+    while (*link != semdata)
+    {
+        link = &(*link)->next;
+    }
+    *link = semdata->next;
+    pthread_mutex_unlock(&liveSemaphoresLock);
+
+    if (!semdata->named)
+    {
+        // the sem_t of an unnamed semaphore was allocated by us
+        free(semdata->handle);
+    }
+    free(semdata);
+    return 0;
+}
 
 
 /*************************************************************************
@@ -654,9 +768,10 @@ RexxRoutine2(RexxObjectPtr, SysCreateEventSem, OPTIONAL_CSTRING, name, OPTIONAL_
     {
         /* this is an unnamed semaphore */
         semdata->handle = (sem_t *)malloc(sizeof(sem_t));
-        rc = sem_init(semdata->handle, 0, 0);
+        rc = semdata->handle == NULL ? -1 : sem_init(semdata->handle, 0, 0);
         if (rc == -1)
         {
+            free(semdata->handle);
             free(semdata);
             return context->String("");
         }
@@ -673,7 +788,7 @@ RexxRoutine2(RexxObjectPtr, SysCreateEventSem, OPTIONAL_CSTRING, name, OPTIONAL_
         }
         semdata->named = true;
     }
-    return context->Uintptr((uintptr_t)semdata);
+    return context->Uintptr(registerSemaphore(semdata));
 }
 
 
@@ -698,10 +813,11 @@ RexxRoutine1(uintptr_t, SysOpenEventSem, CSTRING, name)
     semdata->handle = sem_open(name, 0);
     if (semdata->handle == SEM_FAILED)
     {
+        free(semdata);
         return 0;
     }
     semdata->named = true;
-    return (uintptr_t)semdata;
+    return registerSemaphore(semdata);
 }
 
 
@@ -717,7 +833,11 @@ RexxRoutine1(uintptr_t, SysOpenEventSem, CSTRING, name)
 
 RexxRoutine1(int, SysResetEventSem, uintptr_t, vhandle)
 {
-    RXSEMDATA *semdata = (RXSEMDATA *)vhandle;
+    RXSEMDATA *semdata = findSemaphore(vhandle);
+    if (semdata == NULL)
+    {
+        return 6;
+    }
 
     sem_init(semdata->handle, 1, 0);
     return 0;
@@ -736,7 +856,11 @@ RexxRoutine1(int, SysResetEventSem, uintptr_t, vhandle)
 
 RexxRoutine1(int, SysPostEventSem, uintptr_t, vhandle)
 {
-    RXSEMDATA *semdata = (RXSEMDATA *)vhandle;
+    RXSEMDATA *semdata = findSemaphore(vhandle);
+    if (semdata == NULL)
+    {
+        return 6;
+    }
     int rc;
 
     rc = sem_post(semdata->handle);
@@ -760,40 +884,7 @@ RexxRoutine1(int, SysPostEventSem, uintptr_t, vhandle)
 
 RexxRoutine1(int, SysCloseEventSem, uintptr_t, vhandle)
 {
-    RXSEMDATA *semdata = (RXSEMDATA *)vhandle;
-
-    if (semdata->named == false)
-    {
-        /* this is an unnamed semaphore so we must free the target */
-        if (sem_destroy(semdata->handle))
-        {
-            if (errno == EINVAL)
-            {
-                return 6;
-            }
-            else if (errno)
-            {
-                return 102;
-            }
-        }
-    }
-    else
-    {
-        /* this is a named semaphore */
-        if (sem_close(semdata->handle))
-        {
-            if (errno == EINVAL)
-            {
-                return 6;
-            }
-            else if (errno)
-            {
-                return 102;
-            }
-        }
-    }
-    free(semdata);
-    return 0;
+    return closeSemaphore(vhandle);
 }
 
 
@@ -812,7 +903,11 @@ RexxRoutine1(int, SysCloseEventSem, uintptr_t, vhandle)
 
 RexxRoutine2(int, SysWaitEventSem, uintptr_t, vhandle, OPTIONAL_int, timeout)
 {
-    RXSEMDATA *semdata = (RXSEMDATA *)vhandle;
+    RXSEMDATA *semdata = findSemaphore(vhandle);
+    if (semdata == NULL)
+    {
+        return 6;
+    }
     int rc = 0;
 
     if (timeout != 0)
@@ -875,13 +970,15 @@ RexxRoutine1(RexxObjectPtr, SysCreateMutexSem, OPTIONAL_CSTRING, name)
     {
         return context->String("");
     }
-    if (strlen(name) == 0)
+    // an omitted name (NULL) means an unnamed semaphore, as an empty one does
+    if (name == NULL || strlen(name) == 0)
     {
         /* this is an unnamed semaphore */
         semdata->handle = (sem_t *)malloc(sizeof(sem_t));
-        rc = sem_init(semdata->handle, 0, 0);
+        rc = semdata->handle == NULL ? -1 : sem_init(semdata->handle, 0, 0);
         if (rc == -1)
         {
+            free(semdata->handle);
             free(semdata);
             return context->String("");
         }
@@ -899,7 +996,7 @@ RexxRoutine1(RexxObjectPtr, SysCreateMutexSem, OPTIONAL_CSTRING, name)
         semdata->named = true;
     }
     rc = sem_post(semdata->handle);
-    return context->Uintptr((uintptr_t)semdata);
+    return context->Uintptr(registerSemaphore(semdata));
 }
 
 
@@ -925,10 +1022,11 @@ RexxRoutine1(uintptr_t, SysOpenMutexSem, CSTRING, name)
     semdata->handle = sem_open(name, 0);
     if (semdata->handle == SEM_FAILED)
     {
+        free(semdata);
         return 0;
     }
     semdata->named = true;
-    return (uintptr_t)semdata;
+    return registerSemaphore(semdata);
 }
 
 
@@ -944,7 +1042,11 @@ RexxRoutine1(uintptr_t, SysOpenMutexSem, CSTRING, name)
 
 RexxRoutine2(int, SysRequestMutexSem, uintptr_t, vhandle, OPTIONAL_int, timeout)
 {
-    RXSEMDATA *semdata = (RXSEMDATA *)vhandle;
+    RXSEMDATA *semdata = findSemaphore(vhandle);
+    if (semdata == NULL)
+    {
+        return 6;
+    }
     int rc = 0;
 
     if (timeout != 0)
@@ -996,7 +1098,11 @@ RexxRoutine2(int, SysRequestMutexSem, uintptr_t, vhandle, OPTIONAL_int, timeout)
 
 RexxRoutine1(int, SysReleaseMutexSem, uintptr_t, vhandle)
 {
-    RXSEMDATA *semdata = (RXSEMDATA *)vhandle;
+    RXSEMDATA *semdata = findSemaphore(vhandle);
+    if (semdata == NULL)
+    {
+        return 6;
+    }
     int rc;
     int val;
 
@@ -1037,40 +1143,7 @@ RexxRoutine1(int, SysReleaseMutexSem, uintptr_t, vhandle)
 
 RexxRoutine1(int, SysCloseMutexSem, uintptr_t, vhandle)
 {
-    RXSEMDATA *semdata = (RXSEMDATA *)vhandle;
-
-    if (semdata->named == false)
-    {
-        /* this is an unnamed semaphore so we must free the target */
-        if (sem_destroy(semdata->handle))
-        {
-            if (errno == EINVAL)
-            {
-                return 6;
-            }
-            else if (errno)
-            {
-                return 102;
-            }
-        }
-    }
-    else
-    {
-        /* this is a named semaphore */
-        if (sem_close(semdata->handle))
-        {
-            if (errno == EINVAL)
-            {
-                return 6;
-            }
-            else if (errno)
-            {
-                return 102;
-            }
-        }
-    }
-    free(semdata);
-    return 0;
+    return closeSemaphore(vhandle);
 }
 
 // macOS doesn't support above sem_xxx functions
@@ -1092,8 +1165,99 @@ RexxRoutine1(int, SysCloseMutexSem, uintptr_t, vhandle)
 RexxRoutine2(int, SysSetPriority, OPTIONAL_int32_t, cls, int32_t, prio)
 {
     // priority is the negated prio argument
-    return setpriority(PRIO_PROCESS, 0, -prio) == 0 ? 0 : errno;
+    return setpriority(PRIO_PROCESS, 0, -prio) == 0 ? 0 : HOST_ERRNO(errno);
 }
+
+#if defined( HAVE_CATOPEN ) && defined( __GLIBC__ )
+
+#include <endian.h>
+
+// the magic number of a GNU C library message catalog
+#define GLIBC_CATALOG_MAGIC 0x960408deU
+
+/**
+ * Test whether a file that is a GNU C library message catalog, by its
+ * magic number, has a header and tables that fit in the file.  The library
+ * reads such a catalog without these checks, in catopen() and in catgets():
+ * a table with no buckets ends in a division by zero, and a table or a
+ * message that is not in the file in a read outside of the mapped file.
+ *
+ * The layout is three 32-bit words (magic number, buckets per plane,
+ * planes), two copies of the table (little endian first, big endian second;
+ * each entry is set, message number and offset of the message), and the
+ * messages, each ended by a null character.
+ *
+ * @param name   The name of the catalog file.
+ *
+ * @return false if the file is a catalog that cannot be used.  true in any
+ *         other case, including a file that cannot be read or that is not
+ *         a catalog: catopen() handles those.
+ */
+static bool isUsableCatalog(const char *name)
+{
+    int fd = open(name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+    {
+        return true;
+    }
+
+    bool usable = true;
+    uint32_t *table = NULL;
+    struct stat64 info;
+    uint32_t header[3];
+
+    if (fstat64(fd, &info) == 0 && S_ISREG(info.st_mode) &&
+        pread(fd, header, sizeof(header), 0) == (ssize_t)sizeof(header) &&
+        (header[0] == GLIBC_CATALOG_MAGIC || header[0] == __builtin_bswap32(GLIBC_CATALOG_MAGIC)))
+    {
+        // this is a catalog: from here on, anything wrong makes it unusable
+        usable = false;
+
+        bool swapped = header[0] != GLIBC_CATALOG_MAGIC;
+        uint64_t fileSize = (uint64_t)info.st_size;
+        uint64_t planeSize = swapped ? __builtin_bswap32(header[1]) : header[1];
+        uint64_t planeDepth = swapped ? __builtin_bswap32(header[2]) : header[2];
+        // each entry of a table is three words, and there are two tables
+        const uint64_t entrySize = 3 * sizeof(uint32_t);
+
+        // both tables, and one character of messages at least, must fit
+        // (tested by division, as the product can overflow)
+        if (planeSize != 0 && planeDepth != 0 &&
+            planeSize <= (fileSize - sizeof(header)) / (2 * entrySize) / planeDepth)
+        {
+            uint64_t entries = planeSize * planeDepth;
+            uint64_t tableSize = entries * entrySize;
+            uint64_t messagesSize = fileSize - sizeof(header) - 2 * tableSize;
+            // the library uses the table in the byte order of the machine
+            off_t tableOffset = sizeof(header) + (__BYTE_ORDER == __LITTLE_ENDIAN ? 0 : tableSize);
+            char last;
+
+            table = (uint32_t *)malloc(tableSize);
+            // the last message must be ended, and no offset may point
+            // after the end of the file
+            if (messagesSize > 0 && table != NULL &&
+                pread(fd, &last, 1, (off_t)(fileSize - 1)) == 1 && last == '\0' &&
+                pread(fd, table, tableSize, tableOffset) == (ssize_t)tableSize)
+            {
+                usable = true;
+                for (uint64_t i = 0; i < entries; i++)
+                {
+                    if (table[i * 3 + 2] >= messagesSize)
+                    {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    free(table);
+    close(fd);
+    return usable;
+}
+#endif
+
 
 /**
  * Retrieve an error message from the repository
@@ -1123,6 +1287,15 @@ char* getErrorMessage(const char *repository, int setnum, int msgnum)
     // NLSPATH may contain both %N, which is replaced by the specified
     // catalog name, and %L, which is replaced by the LANG variable.
     nl_catd catalog;                     // catalog handle
+
+#if defined( __GLIBC__ )
+    // a name with a '/' is the file that catopen() will open: the C library
+    // crashes on a damaged catalog, so look at the file first
+    if (strchr(repository, '/') != NULL && !isUsableCatalog(repository))
+    {
+        return strdup("Error: Invalid message catalog");
+    }
+#endif
 
     if ((catalog = catopen(repository, 0)) == (nl_catd)-1)
     {
@@ -1505,7 +1678,7 @@ RexxRoutine1(RexxObjectPtr, SysQueryProcess, OPTIONAL_CSTRING, selector)
     if (iRc)
     {
         char buffer[100];
-        snprintf(buffer, sizeof(buffer), "System error; errno = %d", errno);
+        snprintf(buffer, sizeof(buffer), "System error; errno = %d", HOST_ERRNO(errno));
         return context->NewStringFromAsciiz(buffer);
     }
     if (!strcasecmp(selector, "PTIME")) /* Calculate the used CPU time*/
@@ -1619,7 +1792,7 @@ RexxRoutine1(RexxObjectPtr, SysQueryProcess, OPTIONAL_CSTRING, selector)
 
 RexxRoutine1(RexxStringObject, SysGetErrorText, int32_t, errnum)
 {
-    const char *errmsg = strerror(errnum);
+    const char *errmsg = strerror(HOST_ERRNO_REVERSE(errnum));
     if (errmsg == NULL)
     {
         return context->NullString();

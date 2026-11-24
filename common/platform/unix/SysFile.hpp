@@ -72,9 +72,13 @@ class SysFile
 public:
     SysFile();
 
-    static const int stdinHandle;
-    static const int stdoutHandle;
-    static const int stderrHandle;
+    // NOTE: initialised in-class rather than defined in SysFile.cpp.  This file
+    // is compiled into both librexx and librexxapi, so an out-of-line definition
+    // emits the same symbol in each and violates the ODR (AddressSanitizer flags
+    // it).  In-class constants are compile-time values and emit no symbol.
+    static constexpr int stdinHandle = 0;
+    static constexpr int stdoutHandle = 1;
+    static constexpr int stderrHandle = 2;
 
     enum
     {
@@ -156,5 +160,16 @@ protected:
     bool   fileeof;         // have we reached eof?
     int64_t fileSize;       // current known file size
 };
+
+// An errno value as Rexx programs see it: the RC of CD, the ERROR:n and
+// NOTREADY:n descriptions of streams, the results of SysMkDir, SysFileDelete,
+// SysFileCopy and others.  Every place where an error number from the C
+// library reaches a Rexx program goes through HOST_ERRNO, and every place
+// where a number from a Rexx program goes to the C library (SysGetErrorText)
+// through HOST_ERRNO_REVERSE, so that a port whose C library numbers errors
+// differently from the systems Rexx programs are written for can translate
+// them in one place.  The identity on every platform today.
+#define HOST_ERRNO(e) (e)
+#define HOST_ERRNO_REVERSE(e) (e)
 
 #endif
