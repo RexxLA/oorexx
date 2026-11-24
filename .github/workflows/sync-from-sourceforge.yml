@@ -1,0 +1,103 @@
+# Keeps the GitHub copy of ooRexx in step with SourceForge,
+# where development happens.
+#
+# Every hour it imports new SVN revisions into the GitHub
+# trunk branch and merges trunk into main.
+#
+# trunk contains the original SVN history.
+# main additionally contains GitHub-specific infrastructure.
+#
+# It never force-pushes. Diverging SVN history or merge
+# conflicts cause the run to fail.
+#
+# Both branches are pushed atomically.
+# It uses only the repository's own GITHUB_TOKEN.
+#
+# Test forks can override the SVN repository and trunk path
+# using repository variables SYNC_SOURCE and SYNC_TRUNK.
+
+name: Sync from SourceForge
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-from-sourceforge
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'RexxLA/oorexx' || vars.SYNC_SOURCE != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      SOURCE: ${{ vars.SYNC_SOURCE || 'https://svn.code.sf.net/p/oorexx/code-0' }}
+      TRUNK: ${{ vars.SYNC_TRUNK || 'main/trunk' }}
+
+    steps:
+      - name: Check out GitHub main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install git-svn
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-svn
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Reconstruct SVN tracking
+        run: |
+          old=$(git rev-parse refs/remotes/origin/trunk)
+
+          if ! git log -1 --format=%B "$old" |
+               grep -F "git-svn-id: $SOURCE/$TRUNK@"; then
+            echo "::error::Missing or incompatible git-svn-id."
+            exit 1
+          fi
+
+          git config svn-remote.svn.url "$SOURCE"
+          git config svn-remote.svn.fetch \
+            "$TRUNK:refs/remotes/svn/trunk"
+
+          git update-ref refs/remotes/svn/trunk "$old"
+
+      - name: Fetch SourceForge
+        run: git svn fetch
+
+      - name: Validate SVN history
+        run: |
+          old=$(git rev-parse refs/remotes/origin/trunk)
+          new=$(git rev-parse refs/remotes/svn/trunk)
+
+          if [ "$new" = "$old" ]; then
+            echo "Already in step at ${old:0:8}."
+          elif git merge-base --is-ancestor "$old" "$new"; then
+            echo "Moving trunk ${old:0:8} -> ${new:0:8}:"
+            git log --oneline "$old..$new"
+          else
+            echo "::error::SVN history has diverged; not pushing."
+            exit 1
+          fi
+
+      - name: Merge trunk into main
+        run: |
+          git merge --no-edit refs/remotes/svn/trunk
+
+      - name: Publish both branches (dry run)
+        run: |
+          git push --dry-run --atomic origin \
+            refs/remotes/svn/trunk:refs/heads/trunk \
+            HEAD:refs/heads/main
