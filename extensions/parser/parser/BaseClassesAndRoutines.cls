@@ -110,6 +110,12 @@
 /* 20261124         Rexx.Node, the mixin of all the nodes of the tree: the    */
 /*                  childAttributes, children and parent that six classes     */
 /*                  repeated                                                  */
+/* 20261125         Rexx.Node~firstElement and ~lastElement: the first and    */
+/*                  the last element of every node, both included, in the     */
+/*                  same sense in all of them (NodeElements)                  */
+/* 20261125         Directive.Clause, the clause of a directive, as the       */
+/*                  doClause of a DO: Rexx.Directive~directiveClause is the   */
+/*                  first child of the directive, and owns its semicolon      */
 /*                                                                            */
 /******************************************************************************/
 
@@ -123,6 +129,7 @@
       "or later (THROW); this is r"revision )
 
  .environment~Lambda.Do.Block  = .Lambda.Do.Block
+ .environment~Directive.Clause = .Directive.Clause
  .environment~Rexx.Clause      = .Rexx.Clause
  .environment~Rexx.Directive   = .Rexx.Directive
  .environment~Rexx.Instruction = .Rexx.Instruction
@@ -141,12 +148,28 @@
 -- the node contains, in source order (see TreeChildren), and parent is the
 -- node that contains it, found from its clause (see TreeParent). Clauses and
 -- the package redefine parent; the package, also children.
+--
+-- firstElement and lastElement are the first and the last element of the
+-- node, both included, and mean the same in every node (see NodeElements):
+-- the package goes from the first element of the chain to the last one; a
+-- clause, from the element after the end of the previous clause to its own
+-- end-of-clause element (the clauses share out the chain: the first one has
+-- also the inserted semicolon at its head, as element~clause says); a
+-- block instruction or a body, from its first clause to its last one; a
+-- directive, from its clause to the end of its body; an expression, a term
+-- or a template, from its first token to its last one: the blanks and
+-- comments at its edges are of the node that contains it, the ones inside
+-- are its own. A node without elements has .Nil and .Nil.
 ::Class Rexx.Node MixinClass Object Public
 ::Constant childAttributes ""
 ::Method children
   Return TreeChildren( self )
 ::Method parent
   Return TreeParent( self )
+::Method firstElement
+  Return NodeElements( self )[1]
+::Method lastElement
+  Return NodeElements( self )[2]
 
 /******************************************************************************/
 /* A Rexx Clause                                                              */
@@ -175,8 +198,9 @@
 
   body = package~currentBodies~top
 
-  -- body may be .Nil at the start of a body scan
-  If \self~isA(.Block.Instruction) Then Do
+  -- body may be .Nil at the start of a body scan. A block instruction and a
+  -- directive are not stored: their clauses are (see Directive.Clause)
+  If \self~isA(.Block.Instruction), \self~isA(.Rexx.Directive) Then Do
     If body \== .Nil Then body~clauses~append( self )
     If end \== .Nil Then end~setOwnerClause( self )
   End
@@ -208,9 +232,41 @@
 /* A Directive                                                                */
 /******************************************************************************/
 
+-- A directive goes from its clause to the end of its body, as a block
+-- instruction goes from its first clause to its END. Its clause is a node of
+-- its own, directiveClause (see Directive.Clause), which owns its semicolon.
+-- The nodes that are inside that clause (the value of a ::CONSTANT) are
+-- children of the clause: clauseChildAttributes names them.
+
 ::Class Rexx.Directive Public SubClass Rexx.Clause
-::Constant childAttributes "BODY"
+::Constant childAttributes       "DIRECTIVECLAUSE BODY"
+::Constant clauseChildAttributes ""
 ::Attribute body
+::Attribute directiveClause Get
+::Method init
+  Expose directiveClause
+  Use Strict Arg package, begin, end
+  self~init:super( package, begin, end )
+  directiveClause = .Directive.Clause~new( package, begin, end, self )
+  directiveClause~setParent( self )
+
+/******************************************************************************/
+/* The clause of a directive                                                  */
+/******************************************************************************/
+
+-- From the element after the end of the previous clause to the semicolon
+-- that ends the directive. Its children are the nodes of the directive that
+-- are inside it (see Rexx.Directive).
+
+::Class Directive.Clause Public SubClass Rexx.Clause
+::Attribute directive Get
+::Method init
+  Expose directive
+  Use Strict Arg package, begin, end, directive
+  self~init:super( package, begin, end )
+::Method children
+  Expose directive
+  Return TreeChildren( self, directive, directive~clauseChildAttributes )
 
 /******************************************************************************/
 /* ArgArray                                                                   */
@@ -309,31 +365,31 @@ Return
   End
 
 /******************************************************************************/
-/* TreeChildren( node ) -- The children of a node, in source order: the      */
-/*   nodes among the values of the attributes that its childAttributes names */
-/*   (and, for a template, among its items), looking inside arrays. A node   */
-/*   is an object that understands CHILDREN; elements are not children (they */
-/*   are in the chain, between them). A clause is a child only when its      */
-/*   parent is the node, and its labels and null clauses come with it (they  */
-/*   are its siblings).                                                      */
+/* TreeChildren( node ) -- The children of a node, in source order: the       */
+/*   nodes among the values of the attributes that its childAttributes names  */
+/*   (and, for a template, among its items), looking inside arrays. A node    */
+/*   is an object that understands CHILDREN; elements are not children (they  */
+/*   are in the chain, between them). A clause is a child only when its       */
+/*   parent is the node, and its labels and null clauses come with it (they   */
+/*   are its siblings). The attributes may be of another object, holder,      */
+/*   and other names: the clause of a directive takes the nodes of its        */
+/*   directive that are inside it (see Directive.Clause).                     */
 /******************************************************************************/
 
 ::Routine TreeChildren Public
-  Use Strict Arg node
+  Use Strict Arg node, holder = (node), names = (node~childAttributes)
   kids = .Array~new
   seen = .IdentityTable~new
-  If node~isA(.Array) Then Do item Over node
+  If holder~isA(.Array) Then Do item Over holder
     Call TreeCollect item, kids, seen, node
   End
-  Do name Over node~childAttributes~makeArray(" ")
-    Call TreeCollect node~send(name), kids, seen, node
+  Do name Over names~makeArray(" ")
+    Call TreeCollect holder~send(name), kids, seen, node
   End
   If kids~items < 2 Then Return kids
   -- In the order of the chain (positions are not enough: inserted elements
   -- may have the position of what follows them): walk the chain from the
   -- first element of the node, and take each child at its first element.
-  -- The body of a directive comes after the directive, so the walk may go
-  -- beyond the end of the node.
   byFirst = .IdentityTable~new
   Do kid Over kids
     byFirst[ TreeFirstElement( kid ) ] = kid
@@ -367,8 +423,8 @@ Return
   End
 
 /******************************************************************************/
-/* TreeFirstElement( node ) -- The first element of a node: a clause begins  */
-/*   after its "begin" (the EL.END_OF_CLAUSE before it); any other node, at  */
+/* TreeFirstElement( node ) -- The first element of a node: a clause begins   */
+/*   after its "begin" (the EL.END_OF_CLAUSE before it); any other node, at   */
 /*   its "begin".                                                             */
 /******************************************************************************/
 
@@ -380,9 +436,48 @@ Return
   Return begin~next
 
 /******************************************************************************/
-/* TreeParent( node ) -- The parent of a node that is not a clause (an       */
-/*   expression, a term, a template): it is not stored, but found walking    */
-/*   down from the clause of its first element.                              */
+/* NodeElements( node ) -- The first and the last element of a node, both     */
+/*   included (see Rexx.Node), as an array of two, or of two .Nil when the    */
+/*   node has no elements. They come from "begin" and "end", which say it     */
+/*   in three ways: the package has both included; a clause, a block          */
+/*   instruction and a body have "begin" (the end-of-clause element before    */
+/*   them) excluded and "end" (their own) included; an expression, a term     */
+/*   and a template have "begin" included and "end" (the first element that   */
+/*   comes after them) excluded, with the blanks and comments that come       */
+/*   before it.                                                               */
+/******************************************************************************/
+
+::Routine NodeElements Public
+  Use Strict Arg node
+  none  = Array( .Nil, .Nil )
+  begin = node~begin
+  end   = node~end
+  If begin == .Nil | end == .Nil Then Return none
+
+  If node~isA(.Rexx.Package) Then Return Array( begin, end )
+
+  If node~isA(.Rexx.Clause) Then Do
+    If node~isA(.Rexx.Directive), node~body \== .Nil Then Do
+      last = NodeElements( node~body )[2]
+      If last \== .Nil Then end = last
+    End
+    -- The head of the chain belongs to the first clause (see element~clause)
+    If begin~prev == .Nil Then Return Array( begin, end )
+    Return Array( begin~next, end )
+  End
+
+  If begin == end           Then Return none
+  If begin < .EL.END_OF_CLAUSE Then Return none
+  last = end~prev
+  Loop While last \== begin, last~ignorable == 1
+    last = last~prev
+  End
+  Return Array( begin, last )
+
+/******************************************************************************/
+/* TreeParent( node ) -- The parent of a node that is not a clause (an        */
+/*   expression, a term, a template): it is not stored, but found walking     */
+/*   down from the clause of its first element.                               */
 /******************************************************************************/
 
 ::Routine TreeParent Public
@@ -418,7 +513,7 @@ Return
 
 /******************************************************************************/
 /* Generate syntax errors                                                     */
-/*   When we detect a syntax error in the program being parsed, we build a   */
+/*   When we detect a syntax error in the program being parsed, we build a    */
 /*   Rexx.Parser.Error (see below) and throw it as the USER condition         */
 /*   REXX.PARSER.ERROR (THROW, RFE #31), with the error object as its         */
 /*   ADDITIONAL. A SYNTAX condition is always an error of the parser itself,  */
