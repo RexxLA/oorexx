@@ -20,7 +20,7 @@ history, its publications and the RexxPub publishing framework that uses it:
 is all a program needs. `parser.cls` is the only file that has to be found in
 the search path; it finds everything else in its `parser/` directory, next to
 it. The version is `.Rexx.Parser~version` (a release and a refresh date,
-`"0.7 20261121"`).
+`"1.0 20261126"`).
 
 The parser needs ooRexx 5.3.0 r13562 or later (THROW).
 
@@ -72,6 +72,10 @@ In `parser/modules/`:
 - `Load.Parser.Module.rex` ... the loader of the parser's modules: a module
                                adds methods to the parser's classes, and
                                calls the loader to define them
+- `print.cls`              ... the print module: it makes the nodes of the
+                               tree printable, as normalized source
+                               (`node~string`, `instruction~makeArray`,
+                               `package~makeArray`)
 - `identity.cls`           ... the identity compiler: it compiles a program,
                                through the parser's tree, to an identical copy
                                of itself, and so it is a skeleton for other
@@ -92,6 +96,16 @@ In `parser/modules/`:
                                `EnableExperimentalFeatures.rex`, which a
                                translated program calls to add the methods
                                to their classes
+
+A program uses the print module with
+
+```rexx
+::Requires "parser.cls"
+::Requires "parser/modules/print.cls"
+```
+
+and, for a `parser = .Rexx.Parser~new(name, source)`, prints the program,
+one line per element of the array, with `parser~package~makeArray`.
 
 A program uses the identity compiler with
 

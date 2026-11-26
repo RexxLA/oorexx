@@ -122,6 +122,16 @@
 /*                  ../rexxpub/: the parser and RexxPub no longer share a     */
 /*                  tree); the header says that "rexx" is caseless, as it is  */
 /*                  since 20261027                                            */
+/* 20261126    1.0  A mistake in the document (a bad option, a block with no  */
+/*                  end, a bad style patch, the bad attributes of a mention)  */
+/*                  is a Rexx.Parser.DocumentError, thrown as USER            */
+/*                  REXX.PARSER.DOCUMENTERROR, that says the file and the     */
+/*                  line, and no longer a SYNTAX 88.900. A bad patch= or      */
+/*                  patchfile= stopped with a traceback, and said neither     */
+/*                  the file nor the line                                     */
+/* 20261126         A style= that names no style is a mistake in the          */
+/*                  document (StyleFile): the block had no colours, and       */
+/*                  nothing said why                                          */
 /*                                                                            */
 /******************************************************************************/
 
@@ -284,9 +294,11 @@ Do optional Over "Spots", "GridTables"
 End
 
 ::Requires "BaseClassesAndRoutines.cls"
+::Requires "DocumentError.cls"
 ::Requires "Highlighter.cls"
 ::Requires "StylePatch.cls"
 ::Requires "HTMLClasses.cls"
+::Requires "StyleSheet.cls"
 
 --------------------------------------------------------------------------------
 -- Main routine                                                               --
@@ -349,7 +361,12 @@ End
   proseAttributes = ""
   If defaultOptions.default \== "" Then
     proseAttributes = "{"defaultOptions.default"}"
-  proseOptions.  = ParseOptions( filename, proseAttributes, defaultStyle )
+  Do
+    proseOptions. = ParseOptions( filename, proseAttributes, defaultStyle )
+  Catch co = Syntax 88.900
+    DocumentError( co~additional~lastItem "in the default options", "", -
+      filename )
+  End
   proseHTMLClass = HTMLClasses( proseOptions. )
 
   -- program= : sibling code fences sharing a program= name are one logical
@@ -453,7 +470,7 @@ End
         End
         Do i = 1 To lineNo - 1
           If verbatim~hasIndex(i) Then processed~append( source[i] )
-          Else processed~append( ScanProseMentions( source[i], proseHTMLClass, defaultStyle, proseOptions. ) )
+          Else processed~append( ProseLine( filename, source[i], i + accum, proseHTMLClass, defaultStyle, proseOptions. ) )
         End
         processed~appendAll( table~lines )
         source   = source~section( table~last + 1 )
@@ -595,7 +612,7 @@ End
     -- mentions (ScanProseMentions is a no-op on a line with none).
     Do i = 1 To start - 1
       If verbatim~hasIndex(i) Then processed~append( source[i] )
-      Else processed~append( ScanProseMentions( source[i], proseHTMLClass, defaultStyle, proseOptions. ) )
+      Else processed~append( ProseLine( filename, source[i], i + accum, proseHTMLClass, defaultStyle, proseOptions. ) )
     End
 
     -- We now copy the highlighted lines
@@ -615,7 +632,7 @@ End
   -- Copy any remaining line in the source array -- also prose, also scanned
   Do i = 1 To source~items
     If verbatim~hasIndex(i) Then processed~append( source[i] )
-    Else processed~append( ScanProseMentions( source[i], proseHTMLClass, defaultStyle, proseOptions. ) )
+    Else processed~append( ProseLine( filename, source[i], i + accum, proseHTMLClass, defaultStyle, proseOptions. ) )
   End
 
   -- Final pass: swap each <!--rxprogram:KEY:k AS-IS--> placeholder for its
@@ -627,8 +644,30 @@ End
 
 MissingEndMarker:
   -- lineNo counts from the end of the last block: accum is what came before
-  Raise Syntax 88.900 -
-    Additional("Missing end marker for code block starting at line "lineNo + accum)
+  DocumentError( "Missing end marker for this code block", lineNo + accum, -
+    filename, source[lineNo] )
+
+--------------------------------------------------------------------------------
+-- DocumentError -- throw a Rexx.Parser.DocumentError                         --
+--------------------------------------------------------------------------------
+
+::Routine DocumentError Private
+  Use Strict Arg message, line, filename, sourceLine = ""
+  .Rexx.Parser.DocumentError~new( message, line, filename, sourceLine )~throw
+
+--------------------------------------------------------------------------------
+-- ProseLine -- ScanProseMentions, for line lineNo of the document: a mention --
+-- whose attributes are wrong is a mistake in the document, at that line      --
+--------------------------------------------------------------------------------
+
+::Routine ProseLine Private
+  Use Strict Arg filename, line, lineNo, HTMLClass, style, options.
+  Do
+    Return ScanProseMentions( line, HTMLClass, style, options. )
+  Catch co = Syntax 88.900
+    DocumentError( co~additional~lastItem "in a mention", lineNo, filename, -
+      line )
+  End
 
 --------------------------------------------------------------------------------
 -- GridCells -- each cell of a grid table, a document of its own              --
@@ -689,8 +728,9 @@ MissingEndMarker:
 -- line). A span whose content does not resolve to a published name (see
 -- ProseElementTags) is left completely untouched, backticks and all --
 -- vocabulary is FencedCode's to validate, but silently, since we have no
--- author-facing error channel for a line of prose (unlike a fenced block's
--- Syntax 88.900). This may change once there is a natural place to warn.
+-- author-facing channel for a warning on a line of prose (a fenced block's
+-- mistakes are a Rexx.Parser.DocumentError). This may change once there is a
+-- natural place to warn.
 --
 -- ARGUMENTS
 --   line:      One line of prose (never a fence line; the caller only
@@ -2031,6 +2071,7 @@ MissingEndMarker:
         When "patchfile"    Then Options.patchfile    = value
         When "patch"        Then Options.patch        = value
         When "style"        Then Do
+          Call StyleIsKnown value
           Options.style              = value
           Options.["STYLE-EXPLICIT"] = 1  -- author asked for this style
         End
@@ -2138,6 +2179,26 @@ BadOptions:
   Raise Syntax 88.900 Additional("Invalid options '"options"'")
 
 --------------------------------------------------------------------------------
+-- StyleIsKnown - a style= that names no style is a mistake in the document:  --
+-- a SYNTAX 88.900, that ParseOptions' callers make a DocumentError, with     --
+-- the line. A style is looked for as StyleFile looks for it: the parser's    --
+-- styles, REXX_PARSER_STYLE_PATH (RexxPub adds its css/ there) and the       --
+-- styles of the author's own (LocalStyle). The page linked                   --
+-- rexx-NAME.css, which did not exist, and the block had no colours.          --
+-- A file name (a "/", or ".css") is left as it was: it is not checked.       --
+--------------------------------------------------------------------------------
+
+::Routine StyleIsKnown Private
+  Use Strict Arg style
+  If Pos("/", style) + Pos("\", style) > 0 | style~caselessEndsWith(".css") Then
+    Return
+  Do
+    Call StyleFile style
+  Catch co = Syntax 98.900
+    Raise Syntax 88.900 Additional( co~additional[1] )
+  End
+
+--------------------------------------------------------------------------------
 -- FenceOptions - ParseOptions for the fence at line `lineNo` of `filename`:  --
 -- an error in the options says where the fence is. "Invalid option          --
 -- 'start-from'" alone left the author to search the document for it.        --
@@ -2148,9 +2209,7 @@ BadOptions:
   Do
     Return ParseOptions( filename, attributes, defaultStyle )
   Catch co = Syntax 88.900
-    what = co~additional~lastItem
-    Raise Syntax 88.900 Additional( what "in the code block at line" lineNo -
-      "of" filename": '"Strip(fence)"'" )
+    DocumentError( co~additional~lastItem, lineNo, filename, fence )
   End
 
 --------------------------------------------------------------------------------
@@ -2225,11 +2284,12 @@ BadOptions:
 -- FenceKeyIsKnown - is `key`, the name of a key=value option on a ```rexx    --
 -- fence or a Rexx prose mention, one that ParseOptions acts on?              --
 --                                                                            --
--- Any other key is an error there (88.900, "Invalid option"): a pipeline     --
--- that would rather drop it, and say so, asks here first (md2slides,          --
--- StripForeignOptions: `level=2` on a mention stopped the build). Keep it in --
--- step with the Select in ParseOptions, plus program= (ProcessPrograms takes --
--- it off before ParseOptions runs). Case is ignored, as there.               --
+-- Any other key is an error there ("Invalid option", a DocumentError): a     --
+-- pipeline that would rather drop it, and say so, asks here first            --
+-- (md2slides, StripForeignOptions: `level=2` on a mention stopped the        --
+-- build). Keep it in step with the Select in ParseOptions, plus program=     --
+-- (ProcessPrograms takes it off before ParseOptions runs). Case is ignored,  --
+-- as there.                                                                  --
 --------------------------------------------------------------------------------
 ::Routine FenceKeyIsKnown Public
   Use Strict Arg key
@@ -2248,14 +2308,23 @@ BadOptions:
 
   Do
     -- Process patch files, if any
+    -- (a patch that cannot be read is a mistake in the document, at the
+    -- line of the fence)
     patches = .Nil
-    If options.patch \== "" Then Do
-      patches = .StylePatch~of( Options.patch )
-    End
-    Else If options.patchfile \== "" Then Do
-      fn = options.path"/"options.patchfile
-      patches = File2Array(fn)
-      patches = .StylePatch~of( patches )
+    Do
+      If options.patch \== "" Then Do
+        patches = .StylePatch~of( Options.patch )
+      End
+      Else If options.patchfile \== "" Then Do
+        fn = options.path"/"options.patchfile
+        patches = File2Array(fn)
+        patches = .StylePatch~of( patches )
+      End
+    Catch co = Syntax 88.900
+      what = co~additional~lastItem
+      If options.patch \== "" Then what = what "in patch="
+      Else what = what "in patchfile="options.patchfile
+      DocumentError( what, start + accum, filename, source[start] )
     End
 
     fn = options.["SOURCE"]
@@ -2307,10 +2376,6 @@ BadOptions:
 
     Return res
   End
-
-MissingEndMarker:
-  Raise Syntax 88.900 -
-    Additional("Missing end marker '-->' for code block at line "start)
 
 --------------------------------------------------------------------------------
 -- ProcessPrograms -- STEP ONE: resolve every program= group, whole           --
